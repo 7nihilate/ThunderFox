@@ -2,21 +2,21 @@
 
 Is the dialogue too quiet in the movie you're watching? And are the explosions too loud? This extension will even out the audio levels, ensuring a more predictable listening experience. ThunderFox is a lightweight Firefox extension that applies loudness maximization to media elements (audio and video) on web pages. Additionally, a customizable EQ can be applied.
 
-The processing has three stages: an OTT-style multiband compressor, a graphic equaliser and a look-ahead brickwall limiter.
+The processing has four stages: an auto level, a three-band compressor with optional noise reduction, a graphic equaliser and a look-ahead brickwall limiter. It runs on Firefox for desktop and Firefox for Android.
 
 ## Features
 
-- Three-band upward **and** downward ("OTT-style") compression in an AudioWorklet, split by a 4th-order Linkwitz-Riley crossover at 120 Hz and 5 kHz (adjustable under Advanced).
-- OTT's controls: **Depth**, **Mix**, **Attack**, **Release**, global **Upward**/**Downward**, plus per-band Up, Down and Gain, with the stock preset at half depth as the defaults.
-- An optional **linear-phase** band split: complementary FIR pairs that sum to a pure delay, for zero phase rotation at the crossovers, at the cost of about 11 ms of latency and more CPU.
-- A true look-ahead brickwall limiter in an AudioWorklet: no clipping, no saturation, no waveshaping. Material below the ceiling passes through untouched.
-- A **program-dependent release** in the limiter: transients recover in milliseconds, sustained limiting recovers over seconds, so driving it hard does not pump.
+- **Auto level**: a slow, LUFS-style loudness rider that brings every tab and every video to the same target level, and holds still through pauses instead of turning up the silence.
+- **Three-band gain-riding compressor** in an AudioWorklet, split by 4th-order Linkwitz-Riley crossovers at 150 Hz and 2.5 kHz (adjustable under Advanced). One **Density** control sets how hard it works.
+- Optional **noise reduction**: a per-band downward expander that pulls hiss and room tone down in pauses, keyed on the level *before* the auto level so its boost never fools it.
+- A true look-ahead brickwall limiter in an AudioWorklet: no clipping, no saturation, no waveshaping. The stages before it set the level, so it only catches stray peaks.
+- A **program-dependent release** in the limiter: transients recover in milliseconds, sustained limiting recovers over seconds, so it does not pump.
 - **Inter-sample peak (true peak) detection** in the limiter, so the output does not overshoot 0 dBFS once a downstream resampler or codec reconstructs it.
-- A single Loudness macro that drives multiband depth and limiter drive together.
 - 8-band equaliser with shelves at the extremes and a live response curve.
 - Global highpass ("Bass cut"), user-toggleable, between the multiband stage and the limiter.
-- Input and output level meters.
+- Input and output level meters, plus live auto level gain and limiter reduction readouts.
 - A site exemption list, and automatic detection of media ThunderFox cannot safely process.
+- Built to keep up on a phone: the audio thread costs about 1.5% of its deadline on a desktop during playback, under 1% while paused, and allocates nothing.
 
 ## Signal chain
 
@@ -24,10 +24,13 @@ The processing has three stages: an OTT-style multiband compressor, a graphic eq
 media element(s)
   -> shared input
   -> pre-boost (0 to +24 dB, user)
-  -> OTT worklet: LR4 (or linear-phase FIR) crossover -> per band { downward + upward comp, makeup, band gain }
+  -> dynamics worklet:
+       auto level (K-weighted loudness, gated)
+       -> LR4 three-band split
+       -> per band { gain rider x expander (noise reduction) x band gain }
   -> highpass (optional)
   -> 8-band EQ (optional)
-  -> limiter worklet: drive (Loudness macro, 0 to +24 dB) -> look-ahead brickwall limiter (5 ms, true-peak)
+  -> limiter worklet: look-ahead brickwall limiter (5 ms, true-peak)
   -> destination
 ```
 
@@ -35,38 +38,70 @@ Every media element on the page feeds one shared chain, so two videos playing at
 
 Three properties of this chain matter:
 
-- **All makeup gain is upstream of the limiter.** Nothing adds level after the limiting stage. Loudness is raised by driving the limiter harder, never by amplifying its output.
-- **The crossover sums flat.** The three bands reconstruct to within 0.001 dB from 20 Hz to 19 kHz, so there is no empirical band trim anywhere in the code.
-- **The limiter is transparent, not a clipper.** It delays the signal and computes the gain envelope from samples that have not played yet, so peaks are handled by a smooth gain curve rather than by reshaping the waveform. Under sustained drive that curve follows the programme's level, not its individual peaks.
+- **The level is set before the limiter, not by it.** Loudness sets the auto level's target, and the band thresholds follow that target, so the programme arrives at the limiter with its peaks already near the ceiling rather than over it. Nothing drives the limiter, and nothing adds level after it. At the default settings the test suite measures the limiter's reduction at 0 dB 95% of the time across the whole Loudness range, with an occasional peak caught by well under 1 dB.
+- **The crossover sums flat.** The three bands reconstruct to the same allpass at every frequency, so there is no empirical band trim anywhere in the code.
+- **The limiter is transparent, not a clipper.** It delays the signal and computes the gain envelope from samples that have not played yet, so peaks are handled by a smooth gain curve rather than by reshaping the waveform.
 
-**Depth scales the compression ratios; Mix is a per-band dry/wet blend.** Both are safe against comb filtering because the blend happens *inside* each band, between the band signal and its own gain-scaled self — the two paths are sample-aligned by construction. Do not add a dry path around the whole chain: the limiter's look-ahead delays the wet path, and an undelayed dry sum would comb.
+Do not add a dry path around the whole chain: the limiter's look-ahead delays the wet path, and an undelayed dry sum would comb.
 
-### The crossover
+### Auto level
 
-A Linkwitz-Riley 4th-order filter is two cascaded Butterworth sections, and its two halves do not sum to unity — they sum to a second-order allpass:
+The auto level measures loudness much as a broadcast loudness meter does. A K-weighting pre-filter (a +4 dB shelf above about 1.5 kHz and a 38 Hz high-pass) feeds summed channel power into 100 ms blocks, and the mean of the last four blocks (400 ms) is the level. Once per block the gain moves towards `target − level`, within the maximum boost and cut:
+
+- **Down** with a time constant of about 1 s, so a loud advert is brought down within a second or two.
+- **Up** with about 8 s, at half speed within 3 dB of the target and never faster than 3 dB/s, so riding inside a song stays inaudible.
+
+Rising is what turns pauses and noise up, so it is **gated against the programme's own level**, a slow follower of the measured level that only moves while the gate is open. Within 10 LU of the programme the gain rises normally; between that and the Pause gate (20 LU below by default) it rises at quarter speed; below the gate, or below −60 LUFS outright, it is frozen. A steadily quiet source is therefore still brought up, while a pause or a sudden drop inside it is not. A faster copy of the same gate (20 ms windows) freezes the rise within a few tens of milliseconds of a pause starting.
+
+Two rules handle the start of something new. If the level stays gated with sound present for 2.5 s, the quieter sound is accepted as the new programme, which is what happens when a quiet video follows a loud one. And for 3 s after a start, or after 5 s of silence, the rise is four times faster, so a new video reaches its level quickly while gain riding within a programme stays slow.
+
+### The band split
+
+A Linkwitz-Riley 4th-order filter is two cascaded Butterworth sections, and its two halves do not sum to unity. They sum to a second-order allpass:
 
 ```
 LP_LR4 + HP_LR4 = (s^2 - sqrt2 s + 1) / (s^2 + sqrt2 s + 1)
 ```
 
-because `(s^2 + 1)^2 - 2 s^2 = s^4 + 1`. Splitting twice therefore leaves the low band one allpass short of the other two. Running the low band through that same allpass makes all three sum to `AP(f1) * AP(f2)` — flat magnitude, no crossover notch. That correction is exact, which is why no band needs a measured trim.
+because `(s^2 + 1)^2 - 2 s^2 = s^4 + 1`. The low crossover splits first, the upper side is split again at the high crossover, and the low band gets an allpass at the high crossover to match the phase that split gives the other two:
 
-### The compressor core
+```
+x -> LP4(f1) -> AP(f2)  = low
+x -> HP4(f1) -> LP4(f2) = mid
+             -> HP4(f2) = high
+```
 
- Each band and channel runs two asymmetric one-pole envelopes on the *squared* sample — one for the downward stage, one for the upward — with per-band base times (low 2.8/40 ms, mid 1.4/28 ms, high 0.7/15 ms attack/release) that the Attack and Release knobs scale exponentially. The downward envelope is clamped to at least the upper threshold and the upward envelope to at most the lower threshold, so each stage is exactly unity until its threshold is crossed. The gain is a power law of the envelope's distance from threshold, and the combined upward gain is clamped at +30 dB. Channels are **not** linked — left and right compress independently. The applied gain runs through a 0.2 ms one-pole smoother, decoupled from the detector: without it the envelope's ripple at twice the signal frequency amplitude-modulates the band, and above about 6 kHz the AM products fold back below Nyquist as discrete inharmonic tones (measured at −65 dBc at 44.1 kHz before the smoother, −82 dBc or better after).
+so the three bands sum to `AP(f1) * AP(f2)`: flat magnitude, no crossover notch. That is 9 biquads per channel.
 
-Two web-specific behaviours: the band gains (the stock +16.3/+11.7/+16.3 dB makeup) are scaled by Depth, so Depth 0 is a true bypass and the Loudness macro's low end stays gentle; and the upward stage plus the positive band gain fade out between −60 and −80 dBFS on a slow envelope of their own (20 ms up, 400 ms down). Without that fade, a noise floor or the gap between tracks comes up by 30 dB plus makeup.
+The filters run a whole render quantum at a time, one section after another, with coefficients and state held in local variables, rather than every section once per sample. Their state is flushed to zero once it decays below 10^-30, and a silent quantum through settled filters skips them altogether (see [Performance](#performance)).
 
-## The Loudness control
+A crossover that is moved glides there at up to 1/64 octave per render quantum, about six octaves a second. Retuning in one step would click, and the host's own 20 ms ramp still makes a large first step.
 
-Loudness drives two things at once:
+### Band riders
 
-| | 0% | 100% |
+Each band has one gain, shared by both channels. The rider compares the band's *output* level, a 1 ms power envelope of the louder channel, against the band's threshold. While the band is over, the gain falls with the band's attack time (about 30 / 12 / 5 ms from low to high, and four times faster when a transient lands more than 6 dB over). While it is under, the gain rises at a steady rate in dB per second (about 10 / 20 / 30 dB/s), slowing a little as it grows, up to the maximum gain. The gain therefore settles where the band's level sits at its threshold, or at the maximum gain if the band is quieter than that.
+
+The gain actually applied is the rider gain raised to the power of **Density**, `G = g^q` with `q = 1 − 1/ratio`:
+
+| Density | Ratio above the threshold | Lift for a quiet band |
 | --- | --- | --- |
-| Multiband depth | 15% | 100% |
-| Limiter drive | +0 dB | +24 dB |
+| 0% | 1:1 (bypass) | none |
+| 50% | 2:1 | half the max gain (+6 dB) |
+| 100% | ∞:1, every band levelled | the full max gain (+12 dB) |
 
-Switching on Advanced hands the Depth control to you; Loudness keeps driving the limiter either way.
+The thresholds are relative to the auto level's target and are calibrated so pink noise at the target settles every band at about +3.5 dB. The multiband adds density without tilting a balanced spectrum. A detector on power rather than raw sample peaks matters at high frequencies: the largest sample in each cycle of a high tone swings by up to 1.5 dB as the sampling grid beats against it, and a peak detector turns that into gain dither and audible sidebands. The applied gain also runs through a 0.2 ms smoother. With both, the worst alias spur on 6 to 12 kHz tones driven hard is below −78 dBc at 48 and 44.1 kHz. The riders share the auto level's fast gate, so their gain stops rising in pauses too.
+
+### Noise reduction
+
+Each band also has a downward expander, switched by **Noise reduction → On** under Advanced (and off whenever Advanced is). It is keyed on the band's level *before* the auto level, so the auto level's boost never changes its decision: a noise floor that is quiet in the source stays classified as quiet however far the auto level turns it up. Below the threshold the expander turns the band down 1 dB for every 1 dB under (a 1:2 expansion), as far as the floor, 12 dB by default. It opens within a few milliseconds of a sound starting and closes over about 50 ms once the band falls under the threshold.
+
+The rider measures the band before the expander, and the two gains are applied together. If the expander came first, the rider would see the quieter band and turn it straight back up.
+
+## The Loudness and Density controls
+
+**Loudness** sets the auto level's target, from −30 LUFS at 0% to −12 LUFS at 100%. The default, 70%, is about −17 LUFS. The top of the range is kept well short of what a limiter would have to supply, so turning Loudness up raises the level of the whole chain rather than squashing peaks.
+
+**Density** is the band riders' ratio (see the table above). Turning it up makes the sound denser and more even, and lifts quiet bands. Turning it to 0% leaves only the auto level and the limiter.
 
 ## Installation (Developer / Temporary)
 
@@ -79,10 +114,12 @@ Switching on Advanced hands the Depth control to you; Loudness keeps driving the
 1. Click the ThunderFox toolbar icon to open the popup.
 2. Toggle the main switch to enable processing.
 3. Toggle "Bass cut" to insert or remove a 200 Hz highpass after the multiband stage and before the limiter.
-4. Adjust "Loudness". It raises multiband depth and limiter drive together, so it adds density rather than peak level.
+4. Adjust "Loudness" for the level every tab is brought to, and "Density" for how hard the multiband works.
 5. Use the "Equalizer" section for tonal shaping, and "Reset" to flatten it.
-6. Switch on "Advanced" for OTT-style and limiter controls (see below).
+6. Switch on "Advanced" for auto level, band, noise reduction and limiter controls (see below). Noise reduction is switched on there, under Noise reduction → On.
 7. Use "Exempt this site" to make ThunderFox ignore the current site, or "Manage exempt sites" to edit the whole list.
+
+Under the meters, "Auto level" shows the gain it is applying (dimmed while its gate is holding it during a pause), and "Limiter" shows the deepest reduction since the last reading. At the default settings the limiter should read 0.0 dB nearly all the time.
 
 ## Site compatibility
 
@@ -103,85 +140,131 @@ The Advanced section is off by default. While it is off, the built-in defaults a
 
 | Control | Range | Default | Applies to |
 | --- | --- | --- | --- |
-| In gain | 0 to +24 dB | 0 dB | Input gain ahead of the crossover |
-| Depth | 0-100% | 50% | Scales the compression ratios and band gains, all bands |
-| Mix | 0-100% | 100% | Per-band dry/wet blend |
-| Upward / Downward | 0-200% | 100% | Global multiplier on each compression direction |
-| Attack / Release | 0-100% | 50% | Envelope times, all bands (exponential, ±55x around the base) |
-| Crossover | 20 Hz to 18 kHz | 120 Hz / 5 kHz | Both band-split points, two thumbs on one slider |
-| Lin. phase | on/off | off | Linear-phase FIR band split (adds latency and CPU) |
-| Up / Down | 0-100% | OTT preset | Per-band ratio of each compression direction |
-| Gain | ±30 dB | +16.3 / +11.7 / +16.3 dB | Per-band output gain (OTT's makeup), scaled by Depth |
+| In gain | 0 to +24 dB | 0 dB | Input gain ahead of everything |
+| Auto level: On | on/off | on | The auto level; off holds it at unity |
+| Max boost | 0 to +24 dB | +15 dB | The most the auto level may raise a quiet programme |
+| Max cut | 0 to 30 dB | 20 dB | The most it may lower a loud one |
+| Speed | 0-100% | 50% | Auto level time constants (4x slower to 4x faster) |
+| Pause gate | −40 to −6 LU | −20 LU | How far below the programme the level must drop to freeze the rise |
+| Crossover | 20 Hz to 18 kHz | 150 Hz / 2.5 kHz | The two band-split points, two thumbs on one slider |
+| Bands: Attack / Release | 0-100% | 50% | Rider times, all bands (4x faster to 4x slower) |
+| Bands: Max gain | 0 to +20 dB | +12 dB | The most a rider may lift a band, before Density |
+| NR: On | on/off | off | Per-band noise reduction |
+| NR: Threshold | −80 to −30 dBFS | −55 dBFS | Band level, before the auto level, below which noise reduction acts |
+| NR: Depth | 0 to 24 dB | 12 dB | The deepest cut noise reduction makes |
+| NR: Speed | 0-100% | 50% | Noise reduction open/close times |
+| Band: Threshold | ±12 dB | 0 dB | Per-band offset of the rider threshold |
+| Band: Gain | ±12 dB | 0 dB | Per-band output gain |
+| Band: NR offset | ±12 dB | 0 dB | Per-band offset of the noise reduction threshold |
 | Attack (limiter) | 0.2-5 ms | 5 ms | Limiter gain-envelope smoothing |
 | Release (limiter) | 10-1000 ms | 80 ms | Limiter recovery after a transient; scales the slow recovery too |
 | Hold | 0-50 ms | 20 ms | Delay before the limiter starts recovering |
 | Ceiling | −3 to 0 dB | −0.3 dB | Limiter output ceiling |
 | True peak | on/off | on | Inter-sample peak detection |
+| Audio buffer | Auto / Low latency / Balanced / Stable | Auto | The AudioContext's output buffer; applies after the page reloads |
 
-**Attack and Release** scale each band's base envelope times exponentially: 50% is the base (low 2.8/40 ms, mid 1.4/28 ms, high 0.7/15 ms), the ends are about 55 times faster or slower. Below about −60 dBFS in a band, the upward gain and the positive band gain fade out so silence stays silent; that fade follows its own slow envelope (20 ms up, 400 ms down) so it closes on a genuine pause rather than fluttering on quiet content.
+**Pause gate** is relative to the programme, not to the target: −20 LU means the auto level stops rising when the level falls 20 LU below what has been playing. Raise it towards −6 LU to freeze on smaller drops (more conservative on speech with pauses); lower it to keep riding quiet passages.
 
-**Up and Down** are the per-band ratios. At 100% Down with full Depth a band is pinned to its upper threshold; smaller values are gentler. The stock preset is 80% Up on every band and 90/85.7/100% Down.
+**Band Threshold** moves one band's threshold up or down. Lower means that band is held down sooner (less of it at the output), higher means it is lifted more before being held.
 
 **Attack (limiter)** is the width of the limiter's gain smoothing, not a conventional attack time. A look-ahead limiter has no attack in the usual sense, because the gain is already in position when the peak arrives; what this sets is how gradually it gets there. The smoothing is a triangular window, so the gain moves along an S-curve with no corner at either end, and it is applied after the release, so the start of a recovery is rounded the same way. It is capped at the worklet's 5 ms look-ahead, since the envelope cannot be smoothed over more samples than it can see. The default is the full 5 ms, the smoothest curve available; shorter settings leave the gain untouched until closer to the peak, at the cost of a steeper curve.
 
-**Release (limiter)** is program-dependent. The limiter keeps its gain reduction in two parts. A new peak goes into the fast part, which recovers exponentially in decibels; Release is the time that takes to give back 90% of a transient's reduction, once the hold has run out. Reduction the programme keeps asking for moves across to the slow part, which recovers along a straight line in decibels: about 3 dB per second at the default, in proportion to the Release setting (half the Release, twice the slope). How readily reduction moves across depends on how long the programme has been over the ceiling, so a lone click comes back entirely on the fast release, while dense material driven hard ends up almost entirely in the slow part. The result is that the gain rides the level of the programme instead of chasing each peak, and the harder the limiter is driven the longer its effective release becomes. There is no switch between the two rates to hear, only a transfer between two continuous quantities.
+**Release (limiter)** is program-dependent. The limiter keeps its gain reduction in two parts. A new peak goes into the fast part, which recovers exponentially in decibels; Release is the time that takes to give back 90% of a transient's reduction, once the hold has run out. Reduction the programme keeps asking for moves across to the slow part, which recovers along a straight line in decibels: about 3 dB per second at the default, in proportion to the Release setting (half the Release, twice the slope). How readily reduction moves across depends on how long the programme has been over the ceiling, so a lone click comes back entirely on the fast release, while dense material ends up almost entirely in the slow part. There is no switch between the two rates to hear, only a transfer between two continuous quantities.
 
-The drive is applied inside the limiter worklet, not by a gain node in front of it, so the limiter knows when it changes. When Loudness is turned down, the reduction the drive was responsible for is handed back in step with it; left to the slow release, the output would drop away and take seconds to come back.
+**Hold** keeps the gain where it is for that long after the detector last asked for it, and restarts each time it asks again. Both parts of the release wait for it. The 20 ms default covers one half-cycle down to 25 Hz, which is what keeps the limiter from modulating bass within the cycle.
 
-The trade is loudness for transparency. A limiter that lets go of every peak within 100 ms is a few dB louder on dense material, and what it adds is the swell between the peaks. To get closer to that, lower Release.
+**In gain** sits before the auto level. With the auto level on it mostly changes how the noise reduction and the gate see the input; with it off, it drives the bands harder.
 
-**Hold** keeps the gain where it is for that long after the detector last asked for it, and restarts each time it asks again. Both parts of the release wait for it. The 20 ms default covers one half-cycle down to 25 Hz, which is what keeps a driven limiter from modulating bass within the cycle.
+**Crossover** is one slider with two thumbs: low/mid and mid/high. The split stays sum-flat wherever they sit. The thumbs cannot cross: each stops one step (about 0.1 octave) short of the other, so the mid band never collapses to nothing. Crossed values are put back in order when read.
 
-**In gain** sits before the crossover, so it drives the compressors harder rather than just making things louder.
-
-**Crossover** is one slider with two thumbs: the left thumb is the low/mid split, the right the mid/high split. The split stays sum-flat wherever they sit, because the three bands always reconstruct to the same allpass pair. The thumbs cannot cross — each stops one step (about 0.1 octave) short of the other, so the mid band never inverts into an overlap remnant — and crossed values from older versions are swapped into order when read.
-
-**Lin. phase** swaps the IIR crossover for complementary FIR pairs inside the worklet. The lowpass is a windowed sinc and the highpass is the delayed input minus it, so the three bands sum to a *pure delay*: exactly flat and exactly linear phase, with no phase rotation at the crossover points and steeper band edges. The costs are latency (542 samples ≈ 11.3 ms at the stock crossovers, so ≈ 16.5 ms with the limiter — still inside lip-sync tolerance) and convolution CPU. Tap counts follow the crossover frequencies (63 to 1023), so a low crossover below about 260 Hz gets a transition band honestly looser (±0.65 octave) than the IIR tree's, and dragging a crossover in this mode can click when the tap count steps. Off by default.
+**Audio buffer** sets how much output buffering the AudioContext asks for. A bigger buffer survives a busy or slow device without dropouts, but the page's video does not know about it, so the sound lags the picture by that much more: typically 10–20 ms at Low latency, 20–40 ms at Balanced and 40–100 ms or more at Stable, depending on the device. Auto is Balanced on Android and Low latency elsewhere. The buffer is fixed for the life of the AudioContext, and the context for the life of the page (an element's audio cannot be moved to a new one), so a change applies after the page reloads. The console logs the context's actual latency when it starts.
 
 The time and frequency sliders are logarithmic, because a linear control across three orders of magnitude would bunch every useful value into the first few pixels. Decibels and percentages are linear.
+
+## Firefox for Android
+
+The manifest declares Android support (`gecko_android`), and the extension is built with a phone in mind:
+
+- **Bigger buffer by default.** Auto picks the Balanced buffer on Android. If audio still drops out, choose Stable under Advanced → Audio buffer and reload the page.
+- **Media is never silenced by autoplay rules.** Taking a media element's audio into an AudioContext that is not allowed to start yet would mute it until the next tap, and it cannot be undone. Android's autoplay rules are stricter than the desktop's, so before taking an element ThunderFox checks that the context is running or can start (`navigator.getAutoplayPolicy`, then a short `resume()`). If it cannot, the element is left playing natively and taken on the next tap or key press.
+- **The context sleeps when nothing plays.** After 30 seconds with no processed media playing, the AudioContext is suspended, which stops the audio thread and lets the output device sleep. It is resumed on the next `play` event, which arrives before any audio is rendered. It is only suspended when the page has had a user gesture, so that resuming is allowed. Returning to a backgrounded tab resumes it as well.
+- **The popup is a full page there**, so its sliders, checkboxes and the two-thumb crossover get larger touch targets.
+
+## Performance
+
+The audio thread has a deadline every render quantum (128 samples, 2.7 ms at 48 kHz), and missing it is a dropout. Measured offline on a desktop, per quantum, for dynamics and limiter together:
+
+| | Before | Now |
+| --- | --- | --- |
+| Playback, mean | 3.9% of the deadline | 1.5% |
+| Playback, 99th percentile | 10.2% | 2.3% |
+| The 30 s after audio stops, mean | 32% | 0.7% |
+| The 30 s after audio stops, 99th percentile | 58% | 1.4% |
+
+A mid-range phone is roughly four times slower than that desktop. The bottom two rows were the real problem: after audio stopped, the filter states decayed exponentially into the subnormal range, where floating-point arithmetic is many times slower on most CPUs, so a paused or quiet page cost more than a playing one. On a phone that alone would exceed the deadline. What changed:
+
+- **Three bands instead of four**: 9 biquads per channel instead of 14.
+- **Blockwise filtering**: each section runs a whole quantum in a tight loop with its coefficients and state in locals. The band riders likewise run one band at a time over the quantum, after a short pass that works out the auto level gain and the gate state per sample, so the result is the same as interleaving them.
+- **Denormal flush**: filter state and envelopes below 10^-30 are set to zero at the end of each quantum.
+- **Silence fast paths**: a silent quantum through settled filters skips the dynamics filters; once the limiter's input has been silent longer than its look-ahead and its envelope is back at zero, a silent quantum skips its loop entirely. Both leave the state exactly as running everything would, which the tests check bit for bit.
+- **An exact true-peak skip**: the limiter's interpolator only runs while a sample loud enough to need it is in its 12-sample window. An interpolated value is at most the sum of the kernel's absolute weights times the loudest tap, so below that the inter-sample peak cannot reach the ceiling and could not have set the reduction.
+- **No allocation in the render loop**, and no doubles passed into non-inlined calls every quantum, which some engines box.
+- **Analysers only while read**: the level meters' analysers are connected only while the popup is open (and the input one while the silence watchdog runs).
 
 ## Site exemptions
 
 - A rule matches the listed domain and all of its subdomains.
 - Exempting a page also exempts everything it embeds in an iframe. A frame cannot read its top-level URL cross-origin, so the background page resolves it.
-- On an exempted page the content script creates no `AudioContext`, observes no DOM and never touches a media element.
+- On an exempted page the content script creates no `AudioContext`, observes no DOM and never touches a media element. The `attachShadow` hook has to be installed at `document_start`, before the exemption list has been read, so while that read is in flight the hook only queues the shadow roots it sees. A page that turns out to be exempted drops the queue and gets the original `attachShadow` back; any other page has the queued roots observed and scanned. (Before this, a shadow root attached in that window stayed observed on an exempted page, and media added to it later was taken.)
 - **Changing an exemption requires a page reload, and the popup toggle performs one for you.** Once `createMediaElementSource()` has been called on a `<video>` or `<audio>` element, that element's audio belongs to the `AudioContext` permanently. Disconnecting only reroutes it; it cannot be handed back to the browser.
 - Turning off an exemption that came from a parent domain removes the parent rule, which affects that domain's other subdomains too. The popup says so before you click.
 
 ## Tuning guidance
 
-- If output is overly compressed or pumping, lower "Loudness", or raise "Release" under Advanced to slow the bands down.
-- If the level audibly rises after loud moments, raise the limiter "Release"; if quiet passages take too long to come back up after loud ones, lower it.
-- If transients sound dulled, lower "Attack".
-- For less bass movement specifically, lower the low band's "Down" rather than changing anything global.
-- For the classic OTT squash, raise "Loudness"; for gentler glue, lower "Depth" or "Mix".
+- If tabs still differ in level, check "Auto level" under the meters: if it sits at the Max boost or Max cut, widen that range.
+- If the level audibly creeps up during quiet passages, raise "Pause gate" (towards −6 LU) or lower the auto level "Speed".
+- If the sound is too dense or breathes, lower "Density", or raise the band "Release" to slow the riders down.
+- If transients sound dulled, raise the band "Attack" (slower) so the riders let the first moments of a hit through.
+- If noise reduction chops the ends of words, lower its "Threshold" or "Depth"; if hiss still comes up in pauses, raise the threshold.
+- For less bass movement specifically, raise the low band's "Threshold" so it is held down later, rather than changing anything global.
 
 ## Troubleshooting
 
 - **No audio at all on one site.** Check the console. ThunderFox logs which elements it skipped and why (`cross-origin`, `drm`), and whether a cross-origin element was reloaded with CORS. If it logs that the page reads as silent, the media is being tainted in a way the pre-check missed — exempt the site.
 - **Some videos on a site are processed and others are not.** The ones left alone are usually served cross-origin from a host that sends no CORS headers; the console says so per element.
-- **Very quiet output.** Raise "Loudness" first, then "In gain" under Advanced.
-- **Distortion.** The limiter applies a gain envelope and nothing else. A little grit on sustained bass is the multiband envelope itself (its ripple is part of the sound; raise "Release" to tame it); anything worse is upstream — back off In gain and Loudness first. The applied compressor gain is smoothed over 0.2 ms, which keeps the envelope's supersonic ripple from folding back as inharmonic alias tones on bright content.
-- **Audio and video drift out of sync.** The chain adds about 5.1 ms: the limiter's look-ahead plus 6 samples for the true-peak detector. The multiband stage is IIR and adds none — unless "Lin. phase" is on, which adds its FIR delay (≈ 11.3 ms at the stock crossovers, ≈ 16.5 ms total). Both are inside normal lip-sync tolerance.
+- **Very quiet output.** Raise "Loudness". If the auto level is already at its Max boost, raise that under Advanced.
+- **Distortion.** The limiter applies a gain envelope and nothing else, and at the defaults it is barely working (watch the "Limiter" readout). The riders' gain moves only on the band's 1 ms power envelope and is smoothed over 0.2 ms. If something sounds driven, back off In gain first.
+- **Audio and video drift out of sync.** The chain adds about 5.1 ms: the limiter's look-ahead plus 6 samples for the true-peak detector. The dynamics stage is IIR and adds none. That is well inside lip-sync tolerance. The AudioContext's output buffer adds more; if the sound lags, set Advanced → Audio buffer to Low latency and reload.
+- **Crackles or dropouts**, especially on a phone. Set Advanced → Audio buffer to Balanced or Stable and reload the page.
 
 ## Development notes
 
-- **Offline DSP tests: `npm test`** (or `node tests/run.js`, no dependencies). `tests/harness.js` evaluates the two worklet files in a `vm` context with `AudioWorkletProcessor`, `registerProcessor` and `sampleRate` shimmed, so the file the extension ships is what runs. `tests/signals.js` has tone, stepped-tone, impulse, pulse-wave (naive and band-limited) and Schroeder-phased multitone generators, deterministic noise and a drums-over-a-bed programme, plus peak, true-peak, RMS, Goertzel THD, gain-trajectory, gain-pumping, worst-spur, magnitude-response and notch-depth measurements. The tests check the limiter's ceiling on tones, impulses and dense material at 48 and 44.1 kHz and while the smoothing and drive controls are moved, that turning the drive down does not leave the output quiet, the reconstructed (true) peak with ISP on, that measured latency equals the reported latency, that a lone transient recovers in about the Release time while sustained limiting recovers over seconds, that the gain neither pumps nor steps on dense material driven 12 and 24 dB over, distortion on driven bass, OTT flatness at depth 0, the OTT transfer curve (quiet up, loud down, range compressed), that the Attack and Release knobs move the envelope times, and steady-tone distortion per band. High-frequency alias spurs are bounded at −78 dBc at both 48 and 44.1 kHz — the spur metric is a guarded max (skipping a band around every harmonic) rather than an integral, because the upward stage legitimately puts a broad masked AM skirt around the carrier while the audible defect is a discrete folded tone. A multitone response check proves the crossover neither tilts at depth 0 nor combs at depth 1, the linear-phase mode is verified to sum to a pure delay, and the settings migration and crossover ordering have tests of their own. Measured values are printed next to each result so tuning changes can be compared.
+- **Offline DSP tests: `npm test`** (or `node tests/run.js`, no dependencies). `tests/harness.js` evaluates the two worklet files in a `vm` context with `AudioWorkletProcessor`, `registerProcessor` and `sampleRate` shimmed, so the file the extension ships is what runs. Its `prepareChain` builds a browser-style render loop over several processors, with every view and parameter array made ahead so the loop itself allocates nothing, and times each quantum. `tests/signals.js` has tone, stepped-tone, impulse, pulse-wave (naive and band-limited) and Schroeder-phased multitone generators, deterministic white and pink noise and a drums-over-a-bed programme, plus peak, true-peak, RMS, Goertzel THD, gain-trajectory, gain-pumping, worst-spur, magnitude-response, notch-depth, AM-sideband, SMPTE and twin-tone IMD, click (energy above a high-pass) and stereo-residual measurements.
+  - **Limiter:** the ceiling on tones, impulses and dense material at 48 and 44.1 kHz and while the smoothing and drive controls move, true peak with ISP on, measured against reported latency, transient versus sustained recovery, no pumping or stepping on dense material driven 12 and 24 dB over, distortion on driven bass, and that gain reduction is reported only while metering.
+  - **Dynamics:** the band split is flat at every crossover setting and routes tones to the right band; the auto level converges to its target from above and below, falls fast and rises slowly and rate-capped, holds still through pauses, accepts a quiet video after a loud one, and acquires quickly after a start; the riders give the right static curve at Density 0, 0.5 and 1, link the channels, time in milliseconds at both rates, stay clean on steady tones, stay bounded on kick and bass, and survive impulses and NaNs; alias spurs stay under −78 dBc at 48 and 44.1 kHz (a guarded max that skips a band around every harmonic, because the audible defect is a discrete folded tone); and noise reduction is a true no-op when off, settles at its floor, passes signal above its threshold, opens within 5 ms, ignores the auto level's boost, and is not undone by the riders.
+  - **Chain:** dynamics into the limiter across the Loudness range and at two input levels, with the limiter required to stay under 1 dB 95% of the time and never pass 6 dB; distortion of a steady tone through the whole chain.
+  - **Audio quality:** rider calibration on pink noise; band isolation (a pulsing bass note must leave no sidebands on a 6 kHz tone: under −100 dBc with the auto level off, −60 dBc with it on); SMPTE and 19 + 20 kHz twin-tone intermodulation through the chain; a panned source keeping its image exactly; exact silence in and out, and every state flushed to zero after a pause; a −80 dBFS tone passing untouched; no clicks when controls move as the host ramps them, when the crossovers are stepped, or when noise reduction and auto level are switched; flatness, ceiling and alias spurs at 88.2 and 96 kHz; two minutes of programme without drift; and the fast paths bit-identical to running everything.
+  - **Real time:** per-quantum cost of the chain against the 2.7 ms deadline (mean and tail, with a projection to a device four times slower); silence costing no more than sound, with and without the fast paths; and no allocation in per-quantum code, checked per site with V8's sampling heap profiler. These use freshly loaded worklets, so the JIT sees what a page would rather than every shape of test that ran before.
+  - **Settings:** crossover ordering, booleans, the buffer choice and its latency hints, the Loudness range and the migrations.
 
-- **Both worklets or neither.** If either AudioWorklet module fails to load, `buildAudioContext()` closes the context and throws, and the page plays natively. A partially built chain — multiband makeup with no limiter behind it — is worse than not processing at all.
+  Measured values are printed next to each result so tuning changes can be compared.
+
+- **Both worklets or neither.** If either AudioWorklet module fails to load, `buildAudioContext()` closes the context and throws, and the page plays natively. A partially built chain — band gain with no limiter behind it — is worse than not processing at all.
 - **The limiter has to be an AudioWorklet.** Look-ahead means reading samples before they play, which no built-in node can do. `DynamicsCompressorNode` has no look-ahead so it always overshoots, and a `WaveShaper` bounds the output only by reshaping the waveform, which is distortion by definition.
 - The limiter's guarantee is structural, and [content/limiter-processor.js](content/limiter-processor.js) carries the proof in its header comment: the reduction applied to any sample is a weighted average of envelope values, each of which is at least a running maximum whose window contains that sample, so it can never be less than what that sample required. The release lives inside that bound: anything added to the gain path must only ever *lower* the gain.
 - `LOOKAHEAD_SECONDS` is fixed on purpose. Changing it while audio is running would resize the delay line and click, so the user-facing timing control adjusts the smoothing width within that window instead. The true-peak history delay is applied whether or not ISP is enabled, for the same reason.
-- **Structural worklet parameters must be stepped, not ramped.** `setTargetAtTime` on the limiter's `smoothing` makes it a different integer on nearly every render quantum, and each change rebuilds the smoothing sums on the audio thread. `setParam()` exists for these; `rampParam()` is for everything else.
-- **Do not delete entries from `STATE.mediaNodes`.** A `MediaElementAudioSourceNode` binds to its element permanently and cannot be recreated; a second `createMediaElementSource()` on the same element throws. Removal from the DOM disconnects, it does not forget. Dropping the entry is what used to mute an element for good the moment a framework re-rendered it.
-- **`MutationObserver` removals are processed before additions.** A remove-then-append in one task produces two records, and handling the addition first leaves the element detached from the graph it was just reconnected to.
+- **The dynamics worklet does no per-sample transcendental math in the common path.** The auto level computes one `log10` and one `exp` per 100 ms block and interpolates its gain linearly; the riders keep their applied gain `g^q` in step by multiplying on attack and recomputing `pow` only every 32 samples; the expander updates every 4 samples; the level parameters are converted to linear only when they change. It allocates nothing per render quantum. See [Performance](#performance) for what keeps it fast and how that is tested.
+- **The fast paths must stay exact.** Each one advances the state precisely as the full loop would, and `fastPath = false` on either processor turns them off; the tests compare the two bit for bit. Anything new added to a processor's state needs handling in its fast path too, or those tests fail.
+- **Structural worklet parameters must be stepped, not ramped.** `setTargetAtTime` on the limiter's `smoothing` makes it a different integer on nearly every render quantum, and each change rebuilds the smoothing sums on the audio thread. The dynamics worklet's on/off switches (`agcEnabled`, `nrEnabled`) are stepped for the same reason. `setParam()` exists for these; `rampParam()` is for everything else.
+- **Do not delete entries from `STATE.mediaNodes`.** A `MediaElementAudioSourceNode` binds to its element permanently and cannot be recreated; a second `createMediaElementSource()` on the same element throws. Dropping the entry is what used to mute an element for good the moment a framework re-rendered it.
+- **Removing a media element from the DOM does not disconnect it.** Players move their media: YouTube re-parents its whole player on every switch to or from theater mode and fullscreen, as a removal and an addition in the same task. Disconnecting on the removal and reconnecting at the next scan used to cut about 0.2 s out of the sound each time. An element that really is removed is paused by the browser (the HTML spec pauses media taken out of the document), so it goes silent without help and is still connected if it comes back.
 - Settings are applied by comparing against the last applied value (`STATE.applied`). The popup both writes storage and messages the tab, so every change arrives twice; without the comparison the second arrival's `cancelScheduledValues` cuts the first ramp short.
-- `common/settings.js` holds defaults, ranges and the Loudness morph, and is loaded by the content script and the popup. Before it existed the popup declared its own copy of every range and they drifted — the EQ sliders were ±12 in the markup and ±18 everywhere else.
-- **Stored settings carry a schema version.** `SETTINGS_VERSION` in `common/settings.js` is bumped whenever a default changes in a way stored values should follow, with a matching entry in `MIGRATIONS`. The background page runs `migrateStored()` on install and update. A migration moves a value only when it still equals the old default, because a stored value silently overrides `DEFAULTS` and there is no other way to tell "never touched" from "set deliberately".
+- `common/settings.js` holds defaults, ranges and the Loudness and Density mappings, and is loaded by the content script and the popup. Before it existed the popup declared its own copy of every range and they drifted — the EQ sliders were ±12 in the markup and ±18 everywhere else.
+- **Stored settings carry a schema version.** `SETTINGS_VERSION` in `common/settings.js` is bumped whenever a default changes in a way stored values should follow, with a matching entry in `MIGRATIONS`. The background page runs `migrateStored()` on install and update. A migration moves a value only when it still equals the old default, because a stored value silently overrides `DEFAULTS` and there is no other way to tell "never touched" from "set deliberately". Version 6 replaced the multiband stage; the old Loudness and multiband values are not carried over, because they meant something else. Version 7 went from four bands to three and resets both crossovers and every band value, whatever they were set to, since each was tuned against a band that no longer exists; the background page also removes the keys of the bands that went (`REMOVED_KEYS`).
 - The EQ's `Q` is 1.27, matched to the 1.11-octave band spacing (`Q = sqrt(2^BW) / (2^BW - 1)`). At `Q = 1.0` the bands are 26% wider than their spacing and eight sliders at +12 dB give about +15 dB. The highpass `Q` is `1/sqrt(2)`; at 1.0 it puts a +1.25 dB bump just above cutoff, on a control called "Bass cut".
 - Switch inputs are hidden with `opacity: 0`, never `display: none`, which would take them out of the tab order and the accessibility tree.
-- **Metering is host-side, not worklet-side.** Two `AnalyserNode` taps — one on the shared input, one on the limiter output — are polled from the content script, and only while a popup is connected on the meter port. Posting levels from inside the worklets would put the work on the audio thread and keep doing it for pages nobody is looking at. The analyser window (4096 samples, 85 ms at 48 kHz) is deliberately longer than the 60 ms poll interval so the windows overlap and no peak falls between two reads.
-- The popup scrolls past 580 px rather than trying to fit Advanced's twenty-one rows. `.controls` sets `grid-template-columns: minmax(0, 1fr)` because grid items default to `min-width: auto`, which otherwise lets a row's min-content width push the column wider than the popup.
+- **Metering only runs while a popup is open.** Level meters are two `AnalyserNode` taps — one on the shared input, one on the limiter output — polled from the content script. The auto level gain and the limiter's reduction come from the worklets themselves, but only after the content script sends them `{type: 'meters', on: true}`, and they stop when the popup disconnects, so a page nobody is looking at does no metering work on the audio thread. The analyser window (4096 samples, 85 ms at 48 kHz) is deliberately longer than the 60 ms poll interval so the windows overlap and no peak falls between two reads.
+- The popup scrolls past 580 px rather than trying to fit Advanced's rows. `.controls` sets `grid-template-columns: minmax(0, 1fr)` because grid items default to `min-width: auto`, which otherwise lets a row's min-content width push the column wider than the popup.
 
 ## License
 

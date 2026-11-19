@@ -5,6 +5,10 @@ const statusEl = document.getElementById('status');
 const hpToggle = document.getElementById('hpToggle');
 const loudnessSlider = document.getElementById('loudness');
 const loudnessValue = document.getElementById('loudness-value');
+const densitySlider = document.getElementById('density');
+const densityValue = document.getElementById('density-value');
+const agcReading = document.getElementById('agcReading');
+const grReading = document.getElementById('grReading');
 const eqBands = document.getElementById('eqBands');
 const eqResetBtn = document.getElementById('eqReset');
 const eqSection = document.querySelector('.eq-section');
@@ -21,53 +25,80 @@ const exemptToggle = document.getElementById('exemptToggle');
 const exemptLabel = document.getElementById('exemptLabel');
 const exemptHint = document.getElementById('exemptHint');
 
+// Firefox for Android shows the popup as a full page, not a dropdown.
+browser.runtime.getPlatformInfo().then((info) => {
+    if (info.os === 'android') document.documentElement.classList.add('android');
+}).catch(() => {});
+
 // Which advanced controls appear, in which order, under which heading. Ranges
 // and defaults come from ThunderFoxSettings so there is one definition of each.
 const ADVANCED_LAYOUT = [
     {
-        group: 'Global', rows: [
-            { key: 'preBoostDb', label: 'In gain' },
-            { key: 'ottDepth', label: 'Depth' },
-            { key: 'ottMix', label: 'Mix' },
-            { key: 'ottUpward', label: 'Upward' },
-            { key: 'ottDownward', label: 'Downward' },
-            { key: 'ottAttack', label: 'Attack' },
-            { key: 'ottRelease', label: 'Release' }
+        group: 'Input', rows: [
+            { key: 'preBoostDb', label: 'In gain' }
+        ]
+    },
+    {
+        group: 'Auto level', rows: [
+            { key: 'agcEnabled', label: 'On', type: 'checkbox' },
+            { key: 'agcMaxBoostDb', label: 'Max boost' },
+            { key: 'agcMaxCutDb', label: 'Max cut' },
+            { key: 'agcSpeed', label: 'Speed' },
+            { key: 'agcGateDb', label: 'Pause gate' }
         ]
     },
     {
         group: 'Crossover', rows: [
-            { type: 'dualRange', lowKey: 'ottLowCrossHz', highKey: 'ottHighCrossHz', label: 'Points' },
-            { key: 'ottLinearPhase', label: 'Lin. phase', type: 'checkbox' }
+            { type: 'multiRange', keys: ['crossLowHz', 'crossHighHz'], label: 'Points' }
         ]
     },
     {
-        group: 'Low band', rows: [
-            { key: 'ottLowUp', label: 'Up' },
-            { key: 'ottLowDown', label: 'Down' },
-            { key: 'ottLowGainDb', label: 'Gain' }
+        group: 'Bands', rows: [
+            { key: 'bandAttack', label: 'Attack' },
+            { key: 'bandRelease', label: 'Release' },
+            { key: 'bandMaxGainDb', label: 'Max gain' }
         ]
     },
     {
-        group: 'Mid band', rows: [
-            { key: 'ottMidUp', label: 'Up' },
-            { key: 'ottMidDown', label: 'Down' },
-            { key: 'ottMidGainDb', label: 'Gain' }
+        group: 'Noise reduction', rows: [
+            { key: 'nrEnabled', label: 'On', type: 'checkbox' },
+            { key: 'nrThresholdDb', label: 'Threshold' },
+            { key: 'nrFloorDb', label: 'Depth' },
+            { key: 'nrSpeed', label: 'Speed' }
         ]
     },
-    {
-        group: 'High band', rows: [
-            { key: 'ottHighUp', label: 'Up' },
-            { key: 'ottHighDown', label: 'Down' },
-            { key: 'ottHighGainDb', label: 'Gain' }
-        ]
-    },
+    ...[['Low', 'Low band'], ['Mid', 'Mid band'], ['High', 'High band']]
+        .map(([band, group]) => ({
+            group, rows: [
+                { key: `band${band}ThresholdDb`, label: 'Threshold' },
+                { key: `band${band}GainDb`, label: 'Gain' },
+                { key: `band${band}NrOffsetDb`, label: 'NR offset' }
+            ]
+        })),
     {
         group: 'Limiter', rows: [
             { key: 'limiterAttackMs', label: 'Attack' },
             { key: 'limiterReleaseMs', label: 'Release' },
             { key: 'limiterHoldMs', label: 'Hold' },
-            { key: 'limiterCeilingDb', label: 'Ceiling' }
+            { key: 'limiterCeilingDb', label: 'Ceiling' },
+            { key: 'limiterIsp', label: 'True peak', type: 'checkbox' }
+        ]
+    },
+    {
+        group: 'Audio buffer', rows: [
+            {
+                key: 'audioLatency', label: 'Buffer', type: 'select',
+                options: [
+                    ['auto', 'Auto'],
+                    ['low', 'Low latency'],
+                    ['balanced', 'Balanced'],
+                    ['stable', 'Stable']
+                ],
+                hint: 'Bigger buffers ride out a busy device without dropouts, '
+                    + 'but the sound lags the picture a little more. Auto is '
+                    + 'Balanced on Android, Low latency elsewhere. Applies '
+                    + 'after the page reloads.'
+            }
         ]
     }
 ];
@@ -170,9 +201,9 @@ function valueToSlider(value, range) {
 
 function formatValue(value, range) {
     if (range.unit === 'percent') return `${Math.round(value * 100)}%`;
-    if (range.unit === 'db') {
+    if (range.unit === 'db' || range.unit === 'lu') {
         const sign = value > 0 ? '+' : '';
-        return `${sign}${value.toFixed(1)} dB`;
+        return `${sign}${value.toFixed(1)} ${range.unit === 'db' ? 'dB' : 'LU'}`;
     }
     if (range.unit === 'hz') {
         if (value >= 1000) {
@@ -192,10 +223,23 @@ function setStatus(enabled) {
     statusEl.textContent = enabled ? 'Enabled' : 'Disabled';
 }
 
-function renderLoudness() {
-    const amount = S.loudnessAmount(settings.limiterThreshold);
-    loudnessSlider.value = String(Math.round(amount * 100));
-    loudnessValue.textContent = `${Math.round(amount * 100)}%`;
+// Loudness reads out as the target it sets; Density as its ratio.
+function renderLoudnessValue(amount) {
+    loudnessValue.textContent = `${S.loudnessProfile(amount).targetLufs.toFixed(1)} LUFS`;
+    loudnessSlider.setAttribute('aria-valuetext', loudnessValue.textContent);
+}
+
+function renderDensityValue(amount) {
+    const q = S.densityProfile(amount).q;
+    densityValue.textContent = q >= 0.995 ? '∞:1' : `${(1 / (1 - q)).toFixed(1)}:1`;
+    densitySlider.setAttribute('aria-valuetext', `ratio ${densityValue.textContent}`);
+}
+
+function renderMacros() {
+    loudnessSlider.value = String(Math.round(settings.loudness * 100));
+    renderLoudnessValue(settings.loudness);
+    densitySlider.value = String(Math.round(settings.density * 100));
+    renderDensityValue(settings.density);
 }
 
 function buildEq() {
@@ -223,7 +267,8 @@ function buildEq() {
 
         const label = document.createElement('span');
         label.className = 'eq-label';
-        label.textContent = band.label;
+        label.textContent = shortEqLabel(band.frequency);
+        label.title = band.label;
 
         container.appendChild(slider);
         wrapper.append(value, container, label);
@@ -244,8 +289,24 @@ function buildEq() {
     eqBands.appendChild(canvas);
 }
 
+// Each band's column is about 26px wide, so the readout drops what it can:
+// "0", "+13", "+3.5", "-15". "+13.0" ran into its neighbours.
+function formatEqGain(gainDb) {
+    if (gainDb === 0) return '0';
+    const text = Number.isInteger(gainDb) ? String(Math.abs(gainDb)) : Math.abs(gainDb).toFixed(1);
+    return `${gainDb > 0 ? '+' : '-'}${text}`;
+}
+
+// The same for the frequency under each slider: "147", "1.5k", "15k". The
+// full label stays in the slider's accessible name.
+function shortEqLabel(frequency) {
+    if (frequency < 1000) return String(frequency);
+    const kilo = frequency / 1000;
+    return `${kilo >= 10 ? Math.round(kilo) : kilo.toFixed(1)}k`;
+}
+
 function renderEqValue(index, gainDb) {
-    eqValues[index].textContent = gainDb >= 0 ? `+${gainDb.toFixed(1)}` : gainDb.toFixed(1);
+    eqValues[index].textContent = formatEqGain(gainDb);
     eqSliders[index].setAttribute('aria-valuetext', `${gainDb.toFixed(1)} decibels`);
 }
 
@@ -259,24 +320,25 @@ function renderEq() {
 }
 
 /**
- * Two thumbs on one rail: two native range inputs stacked on top of each
+ * Several thumbs on one rail: native range inputs stacked on top of each
  * other, their tracks transparent and only their thumbs taking pointer
- * events, over a drawn rail with a fill between the thumbs. Native inputs
- * keep keyboard support (arrows, Home/End) and the focus ring for free.
- * The thumbs cannot cross: each clamps at one slider step (about 0.1 octave
- * on this log scale) short of the other, which keeps the mid band nonzero
- * and the two thumbs separable by mouse.
+ * events, over a drawn rail with a fill from the first thumb to the last.
+ * Native inputs keep keyboard support (arrows, Home/End) and the focus ring
+ * for free. Thumbs cannot cross: each clamps at one slider step (about 0.1
+ * octave on this log scale) short of its neighbours, which keeps every band
+ * nonzero and the thumbs separable by mouse.
  */
-function buildDualRange(row) {
-    // Both keys share the same 20 Hz - 18 kHz log range.
-    const range = S.LIMITS[row.lowKey];
+function buildMultiRange(row) {
+    // Every key shares the same 20 Hz - 18 kHz log range.
+    const range = S.LIMITS[row.keys[0]];
+    const count = row.keys.length;
 
     const wrapper = document.createElement('div');
     wrapper.className = 'row adv-row';
 
     const label = document.createElement('label');
     label.textContent = row.label;
-    label.htmlFor = `adv-${row.lowKey}`;
+    label.htmlFor = `adv-${row.keys[0]}`;
 
     const rail = document.createElement('div');
     rail.className = 'dual-range';
@@ -287,62 +349,55 @@ function buildDualRange(row) {
     fill.className = 'dual-range-fill';
     track.appendChild(fill);
 
-    const lowInput = document.createElement('input');
-    const highInput = document.createElement('input');
-    [[lowInput, row.lowKey, 'Low/mid crossover frequency'],
-        [highInput, row.highKey, 'Mid/high crossover frequency']].forEach(([input, key, aria]) => {
+    const names = ['Low/mid', 'Mid/high'];
+    const inputs = row.keys.map((key, index) => {
+        const input = document.createElement('input');
         input.type = 'range';
         input.id = `adv-${key}`;
         input.min = '0';
         input.max = '100';
         input.step = '1';
-        input.setAttribute('aria-label', aria);
+        input.setAttribute('aria-label', `${names[index] || `Crossover ${index + 1}`} crossover frequency`);
+        return input;
     });
 
-    rail.append(track, lowInput, highInput);
+    rail.append(track, ...inputs);
     wrapper.append(label, rail);
     advancedBody.appendChild(wrapper);
 
-    // Two values do not fit the 50px readout column, so the pair reads out
-    // on its own line under the rail.
+    // Several values do not fit the 50px readout column, so they read out on
+    // their own line under the rail.
     const readout = document.createElement('div');
     readout.className = 'dual-range-readout';
-    readout.id = `adv-${row.lowKey}-value`;
+    readout.id = `adv-${row.keys[0]}-value`;
     advancedBody.appendChild(readout);
 
-    const dual = {
+    const multi = {
         render() {
-            const lowValue = settings[row.lowKey];
-            const highValue = settings[row.highKey];
-            lowInput.value = String(valueToSlider(lowValue, range));
-            highInput.value = String(valueToSlider(highValue, range));
-            const lowText = formatValue(lowValue, range);
-            const highText = formatValue(highValue, range);
-            readout.textContent = `${lowText} – ${highText}`;
-            lowInput.setAttribute('aria-valuetext', lowText);
-            highInput.setAttribute('aria-valuetext', highText);
-            fill.style.left = `${Number(lowInput.value)}%`;
-            fill.style.right = `${100 - Number(highInput.value)}%`;
+            const texts = row.keys.map((key, index) => {
+                inputs[index].value = String(valueToSlider(settings[key], range));
+                const text = formatValue(settings[key], range);
+                inputs[index].setAttribute('aria-valuetext', text);
+                return text;
+            });
+            readout.textContent = texts.join(' · ');
+            fill.style.left = `${Number(inputs[0].value)}%`;
+            fill.style.right = `${100 - Number(inputs[count - 1].value)}%`;
         }
     };
 
-    lowInput.addEventListener('input', () => {
-        if (Number(lowInput.value) > Number(highInput.value) - 1) {
-            lowInput.value = String(Number(highInput.value) - 1);
-        }
-        commit({ [row.lowKey]: sliderToValue(lowInput.value, range) });
-        dual.render();
-    });
-    highInput.addEventListener('input', () => {
-        if (Number(highInput.value) < Number(lowInput.value) + 1) {
-            highInput.value = String(Number(lowInput.value) + 1);
-        }
-        commit({ [row.highKey]: sliderToValue(highInput.value, range) });
-        dual.render();
+    inputs.forEach((input, index) => {
+        input.addEventListener('input', () => {
+            let position = Number(input.value);
+            if (index > 0) position = Math.max(position, Number(inputs[index - 1].value) + 1);
+            if (index < count - 1) position = Math.min(position, Number(inputs[index + 1].value) - 1);
+            input.value = String(position);
+            commit({ [row.keys[index]]: sliderToValue(position, range) });
+            multi.render();
+        });
     });
 
-    advancedControls[row.lowKey] = { dual };
-    advancedControls[row.highKey] = { dual };
+    row.keys.forEach((key) => { advancedControls[key] = { multi }; });
 }
 
 function buildAdvanced() {
@@ -353,8 +408,41 @@ function buildAdvanced() {
         advancedBody.appendChild(heading);
 
         section.rows.forEach((row) => {
-            if (row.type === 'dualRange') {
-                buildDualRange(row);
+            if (row.type === 'multiRange') {
+                buildMultiRange(row);
+                return;
+            }
+            if (row.type === 'select') {
+                const selectRow = document.createElement('div');
+                selectRow.className = 'row adv-row';
+                const selectLabel = document.createElement('label');
+                selectLabel.textContent = row.label;
+                selectLabel.htmlFor = `adv-${row.key}`;
+                const select = document.createElement('select');
+                select.id = `adv-${row.key}`;
+                select.className = 'adv-select';
+                row.options.forEach(([value, text]) => {
+                    const option = document.createElement('option');
+                    option.value = value;
+                    option.textContent = text;
+                    select.appendChild(option);
+                });
+                selectRow.append(selectLabel, select);
+                advancedBody.appendChild(selectRow);
+
+                if (row.hint) {
+                    const hint = document.createElement('p');
+                    hint.className = 'hint-text';
+                    hint.id = `adv-${row.key}-hint`;
+                    hint.textContent = row.hint;
+                    select.setAttribute('aria-describedby', hint.id);
+                    advancedBody.appendChild(hint);
+                }
+
+                advancedControls[row.key] = { select };
+                select.addEventListener('change', () => {
+                    commit({ [row.key]: select.value });
+                });
                 return;
             }
             if (row.type === 'checkbox') {
@@ -409,23 +497,6 @@ function buildAdvanced() {
             });
         });
     });
-
-    // ISP is a switch rather than a slider, so it sits outside the layout table.
-    const ispRow = document.createElement('div');
-    ispRow.className = 'row adv-row';
-    const ispLabel = document.createElement('label');
-    ispLabel.textContent = 'True peak';
-    ispLabel.htmlFor = 'adv-limiterIsp';
-    const ispInput = document.createElement('input');
-    ispInput.type = 'checkbox';
-    ispInput.id = 'adv-limiterIsp';
-    ispRow.append(ispLabel, ispInput);
-    advancedBody.appendChild(ispRow);
-
-    advancedControls.limiterIsp = { input: ispInput };
-    ispInput.addEventListener('change', () => {
-        commit({ limiterIsp: ispInput.checked });
-    });
 }
 
 function renderAdvancedRow(key, value) {
@@ -438,12 +509,16 @@ function renderAdvancedRow(key, value) {
 function renderAdvanced() {
     Object.keys(advancedControls).forEach((key) => {
         const control = advancedControls[key];
-        if (control.dual) {
-            control.dual.render();
+        if (control.multi) {
+            control.multi.render();
             return;
         }
         if (control.input) {
             control.input.checked = !!settings[key];
+            return;
+        }
+        if (control.select) {
+            control.select.value = settings[key];
             return;
         }
         control.slider.value = String(valueToSlider(settings[key], control.range));
@@ -470,6 +545,17 @@ function renderLevelMeter(id, peakDb) {
     }
 }
 
+// The auto level's gain (dimmed while its gate holds it) and the deepest
+// limiter reduction since the last reading.
+function renderReadings(message) {
+    const gain = typeof message.agcGainDb === 'number' ? message.agcGainDb : 0;
+    agcReading.textContent = `${gain > 0 ? '+' : ''}${gain.toFixed(1)} dB`;
+    agcReading.style.opacity = message.agcGate === 2 ? '0.5' : '';
+    agcReading.title = message.agcGate === 2 ? 'Holding: pause or quiet passage' : '';
+    const reduction = typeof message.limiterReductionDb === 'number' ? message.limiterReductionDb : 0;
+    grReading.textContent = `${reduction > 0.05 ? '-' : ''}${reduction.toFixed(1)} dB`;
+}
+
 /* ------------------------------------------------------------------ meters */
 
 function connectMeters() {
@@ -484,6 +570,7 @@ function connectMeters() {
         if (!message || message.type !== 'meters') return;
         renderLevelMeter('meterInput', message.inputDb);
         renderLevelMeter('meterOutput', message.outputDb);
+        renderReadings(message);
     });
 
     meterPort.onDisconnect.addListener(() => { meterPort = null; });
@@ -587,8 +674,14 @@ eqToggle.addEventListener('change', () => {
 
 loudnessSlider.addEventListener('input', () => {
     const amount = Number(loudnessSlider.value) / 100;
-    loudnessValue.textContent = `${Math.round(amount * 100)}%`;
-    commit({ limiterThreshold: -(amount * S.MAX_LOUDNESS_DB) });
+    renderLoudnessValue(amount);
+    commit({ loudness: amount });
+});
+
+densitySlider.addEventListener('input', () => {
+    const amount = Number(densitySlider.value) / 100;
+    renderDensityValue(amount);
+    commit({ density: amount });
 });
 
 advancedToggle.addEventListener('change', () => {
@@ -598,9 +691,7 @@ advancedToggle.addEventListener('change', () => {
 
 advancedResetBtn.addEventListener('click', () => {
     const patch = {};
-    S.ADVANCED_KEYS.forEach((key) => { patch[key] = S.DEFAULTS[key]; });
-    patch.limiterIsp = S.DEFAULTS.limiterIsp;
-    patch.ottLinearPhase = S.DEFAULTS.ottLinearPhase;
+    S.ADVANCED_ALL_KEYS.forEach((key) => { patch[key] = S.DEFAULTS[key]; });
     Object.assign(settings, patch);
     renderAdvanced();
     commit(patch);
@@ -726,7 +817,7 @@ async function init() {
 
     // Paint the defaults before the first await, so the readouts never show a
     // value that lives only in the markup. Stored values replace them below.
-    renderLoudness();
+    renderMacros();
     renderEq();
     renderAdvanced();
 
@@ -748,9 +839,8 @@ async function init() {
         hpEnabled: !!stored.hpEnabled,
         eqEnabled: stored.eqEnabled === undefined ? true : !!stored.eqEnabled,
         advancedEnabled: !!stored.advancedEnabled,
-        limiterThreshold: typeof stored.limiterThreshold === 'number'
-            ? stored.limiterThreshold
-            : S.DEFAULTS.limiterThreshold,
+        loudness: S.sanitizeUnit(stored.loudness, S.DEFAULTS.loudness),
+        density: S.sanitizeUnit(stored.density, S.DEFAULTS.density),
         eqGains: S.sanitizeEqGains(stored.eqGains)
     });
 
@@ -762,7 +852,7 @@ async function init() {
     advancedToggle.checked = settings.advancedEnabled;
     setAdvancedVisibility(settings.advancedEnabled);
 
-    renderLoudness();
+    renderMacros();
     renderEq();
     renderAdvanced();
     renderBlockedNotice(stored.audioBlockedHost);

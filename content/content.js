@@ -1,8 +1,8 @@
 (function() {
     const S = ThunderFoxSettings;
 
-    const OTT_WORKLET_PATH = 'content/ott-processor.js';
-    const OTT_WORKLET_NAME = 'thunderfox-ott';
+    const DYNAMICS_WORKLET_PATH = 'content/dynamics-processor.js';
+    const DYNAMICS_WORKLET_NAME = 'thunderfox-dynamics';
     const LIMITER_WORKLET_PATH = 'content/limiter-processor.js';
     const LIMITER_WORKLET_NAME = 'thunderfox-brickwall-limiter';
 
@@ -22,6 +22,22 @@
     // reload failed and hand it back its original, untouched load.
     const CORS_RELOAD_TIMEOUT_MS = 10000;
 
+    // How long to wait for a suspended context to start before leaving an
+    // element alone for now. Taking an element's audio into a context that
+    // cannot run silences it, so if the browser will not let the context
+    // start (autoplay policy, stricter on Android) the element keeps playing
+    // natively until the next gesture.
+    const CONTEXT_START_TIMEOUT_MS = 300;
+
+    // With no tracked media playing for this long, the context is suspended
+    // so the audio thread and the output device can sleep. Resumed on the
+    // next `play`, which fires before any audio is rendered.
+    const IDLE_SUSPEND_MS = 30000;
+    const IDLE_CHECK_INTERVAL_MS = 5000;
+
+    // Firefox for Android. Content scripts have no runtime.getPlatformInfo.
+    const IS_ANDROID = /Android/i.test(navigator.userAgent);
+
     const STATE = {
         audioContext: null,
         contextReady: null,
@@ -29,7 +45,7 @@
 
         inputGain: null,
         preGain: null,
-        ott: null,
+        dynamics: null,
         hpFilter: null,
         eq: null,
         limiter: null,
@@ -52,12 +68,32 @@
         pendingRoots: new Set(),
         scanTimer: null,
         inert: false,
+        // Set once the exemption check has finished. Until then nothing is
+        // observed or touched: shadow roots the hook sees are only queued in
+        // earlyRoots, and handed over or dropped by the decision.
+        decided: false,
+        earlyRoots: [],
 
         meterPorts: new Set(),
         meterTimer: null,
+        // The latest readings the worklets posted while metering was on.
+        agcReading: null,
+        limiterReductionDb: 0,
         watchdogTimer: null,
         silenceSince: 0,
         silenceReported: false,
+
+        // Whether each analyser is connected. They are only tapped while
+        // something reads them.
+        inputTapped: false,
+        outputTapped: false,
+
+        // Elements left playing natively because the context could not
+        // start when they began; retried once it can.
+        deferred: new Set(),
+        idleTimer: null,
+        idleSince: 0,
+        idleSuspended: false,
 
         settings: Object.assign({}, S.DEFAULTS),
         applied: {}
@@ -108,12 +144,19 @@
     }
 
     async function buildAudioContext() {
-        const ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
+        // The buffer size is fixed for the life of the context, and the
+        // context for the life of the page: once an element's audio has been
+        // taken it cannot be moved to another one. So the choice applies from
+        // the next page load.
+        const advanced = effectiveAdvanced(STATE.settings);
+        const latencyHint = S.latencyHint(advanced.audioLatency, IS_ANDROID);
+        const ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint });
 
         try {
-            // Both worklets or neither. A half-built chain — multiband makeup
-            // with no limiter behind it, say — is worse than not processing at all.
-            await ctx.audioWorklet.addModule(browser.runtime.getURL(OTT_WORKLET_PATH));
+            // Both worklets or neither. A half-built chain — auto level and band
+            // gain with no limiter behind it, say — is worse than not
+            // processing at all.
+            await ctx.audioWorklet.addModule(browser.runtime.getURL(DYNAMICS_WORKLET_PATH));
             await ctx.audioWorklet.addModule(browser.runtime.getURL(LIMITER_WORKLET_PATH));
         } catch (error) {
             STATE.contextFailed = true;
@@ -127,7 +170,7 @@
         STATE.inputGain = ctx.createGain();
         STATE.preGain = ctx.createGain();
 
-        STATE.ott = createOtt(ctx);
+        STATE.dynamics = createDynamics(ctx);
         STATE.hpFilter = createHighpass(ctx);
         STATE.eq = createEqualizer(ctx);
         STATE.limiter = createLimiter(ctx);
@@ -143,16 +186,28 @@
         STATE.outputAnalyser.fftSize = METER_FFT_SIZE;
 
         STATE.inputGain.connect(STATE.preGain);
-        STATE.inputGain.connect(STATE.inputAnalyser);
-        STATE.preGain.connect(STATE.ott.node);
+        STATE.preGain.connect(STATE.dynamics.node);
         STATE.limiter.output.connect(ctx.destination);
-        STATE.limiter.output.connect(STATE.outputAnalyser);
 
         updateRouting();
         applySettingsToGraph(STATE.settings, true);
 
+        console.info('ThunderFox: audio context', {
+            latencyHint,
+            sampleRate: ctx.sampleRate,
+            baseLatency: ctx.baseLatency,
+            outputLatency: ctx.outputLatency
+        });
+
         ctx.onstatechange = () => {
-            if (ctx.state === 'running') removeGestureListeners();
+            if (ctx.state === 'running') {
+                removeGestureListeners();
+                retryDeferred();
+            } else if (ctx.state === 'suspended' && !STATE.idleSuspended) {
+                // Suspended by the browser rather than by us (Android does
+                // this in the background): any gesture may bring it back.
+                installGestureListeners();
+            }
         };
         installGestureListeners();
         resumeContext();
@@ -163,8 +218,8 @@
         return ctx;
     }
 
-    function createOtt(ctx) {
-        const node = new AudioWorkletNode(ctx, OTT_WORKLET_NAME, {
+    function createDynamics(ctx) {
+        const node = new AudioWorkletNode(ctx, DYNAMICS_WORKLET_NAME, {
             numberOfInputs: 1,
             numberOfOutputs: 1,
             outputChannelCount: [2],
@@ -172,6 +227,11 @@
             channelCountMode: 'explicit',
             channelInterpretation: 'speakers'
         });
+
+        node.port.onmessage = (event) => {
+            const data = event.data;
+            if (data && data.type === 'agc') STATE.agcReading = data;
+        };
 
         return { node, parameters: node.parameters };
     }
@@ -212,6 +272,28 @@
         };
     }
 
+    /**
+     * Connect each analyser only while something reads it: the input one for
+     * the meters and the silence watchdog, the output one for the meters.
+     * An analyser that nobody polls still copies every quantum on the audio
+     * thread.
+     */
+    function updateAnalyserTaps() {
+        if (!STATE.audioContext) return;
+        const wantInput = !!STATE.meterTimer || !!STATE.watchdogTimer;
+        const wantOutput = !!STATE.meterTimer;
+        if (wantInput !== STATE.inputTapped) {
+            if (wantInput) STATE.inputGain.connect(STATE.inputAnalyser);
+            else try { STATE.inputGain.disconnect(STATE.inputAnalyser); } catch (_) {}
+            STATE.inputTapped = wantInput;
+        }
+        if (wantOutput !== STATE.outputTapped) {
+            if (wantOutput) STATE.limiter.output.connect(STATE.outputAnalyser);
+            else try { STATE.limiter.output.disconnect(STATE.outputAnalyser); } catch (_) {}
+            STATE.outputTapped = wantOutput;
+        }
+    }
+
     function createLimiter(ctx) {
         const input = ctx.createGain();
 
@@ -222,27 +304,26 @@
 
         input.connect(node);
 
-        // Drive sits ahead of the limiter, so raising Loudness pushes signal
-        // into a fixed ceiling rather than adding gain after the only stage
-        // protecting the output. This is the classic limiter threshold control: lowering
-        // the threshold and making up the difference is the same operation.
-        // It is a parameter of the worklet rather than a gain node in front
-        // of it, so the limiter can let go of reduction as the drive comes
-        // down instead of leaving that to its slow release.
-        const drive = node.parameters.get('drive');
+        // Loudness no longer pushes into the limiter: the auto level and the
+        // band thresholds set the level, and the limiter only catches stray
+        // peaks. Its drive stays at unity.
+        node.port.onmessage = (event) => {
+            const data = event.data;
+            if (data && data.type === 'gr') STATE.limiterReductionDb = data.db;
+        };
 
-        return { input, output: node, drive, node, parameters: node.parameters };
+        return { input, output: node, node, parameters: node.parameters };
     }
 
-    // The optional stages sit between the OTT worklet and the limiter's drive.
+    // The optional stages sit between the dynamics worklet and the limiter.
     function updateRouting() {
-        if (!STATE.audioContext || !STATE.ott || !STATE.limiter || !STATE.eq) return;
+        if (!STATE.audioContext || !STATE.dynamics || !STATE.limiter || !STATE.eq) return;
 
-        [STATE.ott.node, STATE.hpFilter, STATE.eq.output].forEach((node) => {
+        [STATE.dynamics.node, STATE.hpFilter, STATE.eq.output].forEach((node) => {
             try { node.disconnect(); } catch (_) {}
         });
 
-        let current = STATE.ott.node;
+        let current = STATE.dynamics.node;
         if (STATE.settings.hpEnabled) {
             current.connect(STATE.hpFilter);
             current = STATE.hpFilter;
@@ -256,7 +337,7 @@
 
     /* ------------------------------------------------------------- autoplay */
 
-    const GESTURE_EVENTS = ['pointerdown', 'keydown', 'touchstart', 'play'];
+    const GESTURE_EVENTS = ['pointerdown', 'keydown', 'touchstart', 'touchend', 'play'];
 
     function onGesture() {
         resumeContext();
@@ -281,7 +362,97 @@
     function resumeContext() {
         const ctx = STATE.audioContext;
         if (!ctx || ctx.state !== 'suspended') return;
+        STATE.idleSuspended = false;
+        STATE.idleSince = 0;
         ctx.resume().catch(() => {});
+    }
+
+    function delay(ms) {
+        return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    // The page's own answer, where Firefox has one (112+), to whether this
+    // context may start without a gesture.
+    function autoplayPolicy(ctx) {
+        try {
+            if (typeof navigator.getAutoplayPolicy === 'function') return navigator.getAutoplayPolicy(ctx);
+        } catch (_) {}
+        return '';
+    }
+
+    /**
+     * Whether the context is running, or can be started now. Asked before an
+     * element's audio is taken, because a context that cannot run outputs
+     * nothing and the element cannot be given back. Waits a moment for
+     * resume(), since a gesture that just happened usually lets it through.
+     */
+    async function contextCanRun(ctx) {
+        if (ctx.state === 'running') return true;
+        if (ctx.state === 'closed') return false;
+        if (autoplayPolicy(ctx) === 'disallowed') {
+            let activated = false;
+            try { activated = !!(navigator.userActivation && navigator.userActivation.isActive); } catch (_) {}
+            if (!activated) return false;
+        }
+        STATE.idleSuspended = false;
+        await Promise.race([ctx.resume().catch(() => {}), delay(CONTEXT_START_TIMEOUT_MS)]);
+        return ctx.state === 'running';
+    }
+
+    function retryDeferred() {
+        const pending = Array.from(STATE.deferred);
+        STATE.deferred.clear();
+        pending.forEach((mediaEl) => {
+            if (!mediaEl.paused && !mediaEl.ended) wireMediaElement(mediaEl);
+        });
+    }
+
+    // Whether a suspended context could be resumed again without a fresh
+    // gesture. Suspending one that could not would silence the next play.
+    function canResumeLater(ctx) {
+        try {
+            if (navigator.userActivation && navigator.userActivation.hasBeenActive) return true;
+        } catch (_) {}
+        return autoplayPolicy(ctx) === 'allowed';
+    }
+
+    function anyMediaPlaying() {
+        let playing = false;
+        STATE.mediaNodes.forEach((_, el) => {
+            if (!el.paused && !el.ended) playing = true;
+        });
+        return playing;
+    }
+
+    // Idle suspend: nothing tracked has played for IDLE_SUSPEND_MS. Cheap to
+    // poll; the check itself is a few property reads per element.
+    function startIdleWatch() {
+        if (STATE.idleTimer) return;
+        STATE.idleTimer = setInterval(() => {
+            const ctx = STATE.audioContext;
+            if (!ctx || ctx.state !== 'running' || STATE.meterTimer) {
+                STATE.idleSince = 0;
+                return;
+            }
+            if (anyMediaPlaying()) {
+                STATE.idleSince = 0;
+                return;
+            }
+            const now = Date.now();
+            if (!STATE.idleSince) {
+                STATE.idleSince = now;
+                return;
+            }
+            if (now - STATE.idleSince < IDLE_SUSPEND_MS || !canResumeLater(ctx)) return;
+            STATE.idleSuspended = true;
+            ctx.suspend().catch(() => { STATE.idleSuspended = false; });
+        }, IDLE_CHECK_INTERVAL_MS);
+    }
+
+    // Android suspends a page's audio in the background and may not bring it
+    // back by itself.
+    function onVisibilityChange() {
+        if (!document.hidden && anyMediaPlaying()) resumeContext();
     }
 
     /* ------------------------------------------------------- media elements */
@@ -320,6 +491,7 @@
     }
 
     function trackElement(mediaEl) {
+        if (STATE.inert || !STATE.decided) return;
         if (STATE.mediaNodes.has(mediaEl) || STATE.wiring.has(mediaEl)) {
             reconnectElement(mediaEl);
             return;
@@ -336,14 +508,24 @@
             mediaEl.addEventListener('playing', () => {
                 wireMediaElement(mediaEl);
             }, { capture: true });
+            // Media events do not leave a shadow root, so the document-level
+            // listener cannot be relied on to see this one. `play` comes
+            // before any audio, which gives an idle-suspended context time
+            // to start again.
+            mediaEl.addEventListener('play', () => {
+                if (STATE.mediaNodes.has(mediaEl)) resumeContext();
+            }, { capture: true });
         }
 
         if (!mediaEl.paused && mediaEl.readyState >= 2) wireMediaElement(mediaEl);
     }
 
     async function wireMediaElement(mediaEl) {
+        // Last line of defence: an exempted page's media is never taken.
+        if (STATE.inert) return;
         if (STATE.mediaNodes.has(mediaEl)) {
             reconnectElement(mediaEl);
+            resumeContext();
             return;
         }
         if (STATE.wiring.has(mediaEl) || STATE.contextFailed) return;
@@ -380,6 +562,19 @@
             if (STATE.mediaNodes.has(mediaEl)) return;
 
             const ctx = STATE.audioContext;
+            if (!(await contextCanRun(ctx))) {
+                // Leave it playing natively. The context starting (on the
+                // next gesture) or the element's next `playing` retries.
+                if (!STATE.deferred.has(mediaEl)) {
+                    STATE.deferred.add(mediaEl);
+                    console.info('ThunderFox: audio cannot start yet, leaving this media unprocessed until a tap or key press');
+                }
+                installGestureListeners();
+                return;
+            }
+            if (STATE.mediaNodes.has(mediaEl)) return;
+            STATE.deferred.delete(mediaEl);
+
             let source;
             try {
                 source = ctx.createMediaElementSource(mediaEl);
@@ -394,6 +589,7 @@
             reconnectElement(mediaEl);
             resumeContext();
             startWatchdog();
+            startIdleWatch();
         } finally {
             STATE.wiring.delete(mediaEl);
         }
@@ -427,15 +623,6 @@
         STATE.mediaNodes.forEach((_, mediaEl) => reconnectElement(mediaEl));
     }
 
-    // Disconnect only. The map entry stays: the element is bound to its source
-    // node permanently, so if it is re-added we must reuse that node rather than
-    // try to build another one.
-    function detachElement(mediaEl) {
-        const nodes = STATE.mediaNodes.get(mediaEl);
-        if (!nodes) return;
-        try { nodes.source.disconnect(); } catch (_) {}
-        nodes.target = null;
-    }
 
     function skipElement(mediaEl, reason) {
         // 'no-source' is transient — the next `playing` retries — but the
@@ -584,7 +771,14 @@
         const hooked = function(init) {
             const root = Reflect.apply(original, this, [init]);
             if (!STATE.inert) {
-                try { observeRoot(root); } catch (_) {}
+                try {
+                    // Before the exemption check has finished, only remember
+                    // the root. Observing it now would let a page that turns
+                    // out to be exempted have its media found and taken
+                    // through that root anyway.
+                    if (STATE.decided) observeRoot(root);
+                    else STATE.earlyRoots.push(root);
+                } catch (_) {}
             }
             return root;
         };
@@ -649,6 +843,10 @@
     // not one per record.
     function flushPendingScans() {
         STATE.scanTimer = null;
+        if (STATE.inert) {
+            STATE.pendingRoots.clear();
+            return;
+        }
         const roots = Array.from(STATE.pendingRoots);
         STATE.pendingRoots.clear();
         roots.forEach((root) => {
@@ -657,18 +855,17 @@
         });
     }
 
+    // Removals are deliberately ignored. Players move their media around:
+    // YouTube re-parents its whole player container on every switch to or
+    // from theater mode or fullscreen, which arrives as a removal and an
+    // addition in the same task. Disconnecting on the removal and
+    // reconnecting at the next scan cut a fifth of a second out of the
+    // sound each time. A media element that really is removed needs nothing
+    // from us either: the HTML spec pauses it once it is out of the document
+    // at the next stable state, so it falls silent on its own, and it stays
+    // connected to the graph for whenever it comes back.
     function handleMutations(records) {
-        // Removals first: a remove-then-append in the same task produces two
-        // records, and processing the addition first would leave the element
-        // detached from the graph it was just reconnected to.
-        for (const record of records) {
-            record.removedNodes.forEach((node) => {
-                if (!node || node.nodeType !== 1) return;
-                if (node.tagName === 'AUDIO' || node.tagName === 'VIDEO') detachElement(node);
-                else if (node.querySelectorAll) node.querySelectorAll('audio, video').forEach(detachElement);
-            });
-        }
-
+        if (STATE.inert) return;
         for (const record of records) {
             record.addedNodes.forEach((node) => {
                 if (!node || node.nodeType !== 1) return;
@@ -693,6 +890,13 @@
     // upstream of us has been zeroed — almost always CORS tainting we failed to
     // predict. There is no in-page recovery, so the honest move is to say so and
     // point at the exemption, which does work (it reloads the tab).
+    function stopWatchdog() {
+        if (!STATE.watchdogTimer) return;
+        clearInterval(STATE.watchdogTimer);
+        STATE.watchdogTimer = null;
+        updateAnalyserTaps();
+    }
+
     function startWatchdog() {
         if (STATE.watchdogTimer || STATE.silenceReported) return;
         const buffer = new Float32Array(STATE.inputAnalyser.fftSize);
@@ -703,7 +907,11 @@
                 if (!el.paused && !el.ended && !el.muted && el.volume > 0 && el.readyState >= 2) playing = true;
             });
 
-            if (!playing) {
+            // A hidden page or a context that is not running reads as silence
+            // whatever the media's origin. On Android the popup hides the page,
+            // so judging then would blame CORS for the popup being open.
+            const ctx = STATE.audioContext;
+            if (!playing || document.hidden || !ctx || ctx.state !== 'running') {
                 STATE.silenceSince = 0;
                 return;
             }
@@ -718,13 +926,15 @@
             if (peak > 1e-7) {
                 // Audio reaches the graph, so the path is not tainted. Nothing
                 // later can change that for these elements, and polling forever
-                // is not free.
+                // is not free. Withdraw the warning if it was raised too early.
+                if (STATE.silenceReported) clearBlockedFlag();
                 STATE.silenceSince = 0;
-                clearInterval(STATE.watchdogTimer);
-                STATE.watchdogTimer = null;
+                stopWatchdog();
                 STATE.silenceReported = true;
                 return;
             }
+
+            if (STATE.silenceReported) return;
 
             const now = Date.now();
             if (!STATE.silenceSince) {
@@ -734,9 +944,9 @@
 
             if (now - STATE.silenceSince < SILENCE_TIMEOUT_MS) return;
 
+            // Keep polling: if audio turns up later the warning was wrong and
+            // the branch above withdraws it.
             STATE.silenceReported = true;
-            clearInterval(STATE.watchdogTimer);
-            STATE.watchdogTimer = null;
 
             console.warn(
                 'ThunderFox: this page is playing but its audio reads as silent. '
@@ -745,6 +955,14 @@
             );
             browser.storage.local.set({ audioBlockedHost: window.location.hostname }).catch(() => {});
         }, WATCHDOG_INTERVAL_MS);
+        updateAnalyserTaps();
+    }
+
+    function clearBlockedFlag() {
+        browser.storage.local.get({ audioBlockedHost: '' }).then((stored) => {
+            if (stored.audioBlockedHost !== window.location.hostname) return;
+            return browser.storage.local.set({ audioBlockedHost: '' });
+        }).catch(() => {});
     }
 
     /* ------------------------------------------------------------ settings */
@@ -754,9 +972,7 @@
     function effectiveAdvanced(settings) {
         if (settings.advancedEnabled) return settings;
         const base = Object.assign({}, settings);
-        S.ADVANCED_KEYS.forEach((key) => { base[key] = S.DEFAULTS[key]; });
-        base.limiterIsp = S.DEFAULTS.limiterIsp;
-        base.ottLinearPhase = S.DEFAULTS.ottLinearPhase;
+        S.ADVANCED_ALL_KEYS.forEach((key) => { base[key] = S.DEFAULTS[key]; });
         return base;
     }
 
@@ -773,57 +989,63 @@
 
         const applied = STATE.applied;
         const advanced = effectiveAdvanced(settings);
-        const loudness = S.loudnessProfile(S.loudnessAmount(settings.limiterThreshold));
-
-        // Advanced owns Depth when it is switched on; otherwise the Loudness
-        // macro drives it. Drive always comes from Loudness.
-        const depth = settings.advancedEnabled ? advanced.ottDepth : loudness.depth;
+        const loudness = S.loudnessProfile(settings.loudness);
+        const density = S.densityProfile(settings.density);
 
         const targets = {
             preGain: dbToGain(advanced.preBoostDb),
-            drive: dbToGain(loudness.driveDb),
-            depth,
-            mix: advanced.ottMix,
-            attack: advanced.ottAttack,
-            release: advanced.ottRelease,
-            upward: advanced.ottUpward,
-            downward: advanced.ottDownward,
-            lowCrossHz: advanced.ottLowCrossHz,
-            highCrossHz: advanced.ottHighCrossHz,
-            lowUp: advanced.ottLowUp,
-            lowDown: advanced.ottLowDown,
-            lowGainDb: advanced.ottLowGainDb,
-            midUp: advanced.ottMidUp,
-            midDown: advanced.ottMidDown,
-            midGainDb: advanced.ottMidGainDb,
-            highUp: advanced.ottHighUp,
-            highDown: advanced.ottHighDown,
-            highGainDb: advanced.ottHighGainDb,
-            linearPhase: advanced.ottLinearPhase ? 1 : 0,
+            drive: 1,
+            agcEnabled: advanced.agcEnabled ? 1 : 0,
+            targetLufs: loudness.targetLufs,
+            agcMaxBoostDb: advanced.agcMaxBoostDb,
+            agcMaxCutDb: advanced.agcMaxCutDb,
+            agcSpeed: advanced.agcSpeed,
+            agcGateDb: advanced.agcGateDb,
+            crossLowHz: advanced.crossLowHz,
+            crossHighHz: advanced.crossHighHz,
+            density: density.q,
+            bandAttack: advanced.bandAttack,
+            bandRelease: advanced.bandRelease,
+            bandMaxGainDb: advanced.bandMaxGainDb,
+            nrEnabled: advanced.nrEnabled ? 1 : 0,
+            nrThresholdDb: advanced.nrThresholdDb,
+            nrFloorDb: advanced.nrFloorDb,
+            nrSpeed: advanced.nrSpeed,
             ceiling: dbToGain(advanced.limiterCeilingDb),
             smoothing: msToSeconds(advanced.limiterAttackMs),
             limiterRelease: msToSeconds(advanced.limiterReleaseMs),
             hold: msToSeconds(advanced.limiterHoldMs),
             isp: advanced.limiterIsp ? 1 : 0
         };
+        // Per band: the worklet names them low/mid/high, the settings
+        // bandLow/bandMid/bandHigh.
+        const bandParams = [];
+        S.BAND_KEYS.forEach((band) => {
+            const name = band.charAt(0).toLowerCase() + band.slice(1);
+            ['ThresholdDb', 'GainDb', 'NrOffsetDb'].forEach((suffix) => {
+                targets[name + suffix] = advanced[`band${band}${suffix}`];
+                bandParams.push(name + suffix);
+            });
+        });
 
         const changed = (key) => force || applied[key] !== targets[key];
 
         if (changed('preGain')) rampParam(STATE.preGain.gain, targets.preGain);
-        if (changed('drive')) rampParam(STATE.limiter.drive, targets.drive);
 
-        const ott = STATE.ott.parameters;
-        ['depth', 'mix', 'attack', 'release', 'upward', 'downward',
-            'lowCrossHz', 'highCrossHz',
-            'lowUp', 'lowDown', 'lowGainDb', 'midUp', 'midDown', 'midGainDb',
-            'highUp', 'highDown', 'highGainDb'].forEach((key) => {
-            if (changed(key)) rampParam(ott.get(key), targets[key]);
+        const dynamics = STATE.dynamics.parameters;
+        ['targetLufs', 'agcMaxBoostDb', 'agcMaxCutDb', 'agcSpeed', 'agcGateDb',
+            'crossLowHz', 'crossHighHz',
+            'density', 'bandAttack', 'bandRelease', 'bandMaxGainDb',
+            'nrThresholdDb', 'nrFloorDb', 'nrSpeed'].concat(bandParams).forEach((key) => {
+            if (changed(key)) rampParam(dynamics.get(key), targets[key]);
         });
-        // Structural: toggling rebuilds the band splitter inside the worklet,
-        // so it must step between 0 and 1, never ramp through fractions.
-        if (changed('linearPhase')) setParam(ott.get('linearPhase'), targets.linearPhase);
+        // Switches: stepped, never ramped through fractions. The auto level
+        // ramps itself back to unity when switched off.
+        if (changed('agcEnabled')) setParam(dynamics.get('agcEnabled'), targets.agcEnabled);
+        if (changed('nrEnabled')) setParam(dynamics.get('nrEnabled'), targets.nrEnabled);
 
         const limiter = STATE.limiter.parameters;
+        if (changed('drive')) setParam(limiter.get('drive'), targets.drive);
         if (changed('ceiling')) rampParam(limiter.get('ceiling'), targets.ceiling);
         if (changed('limiterRelease')) rampParam(limiter.get('release'), targets.limiterRelease);
         if (changed('hold')) rampParam(limiter.get('hold'), targets.hold);
@@ -860,9 +1082,8 @@
             next.eqEnabled = patch.eqEnabled;
             routingChanged = true;
         }
-        if (typeof patch.limiterThreshold === 'number' && isFinite(patch.limiterThreshold)) {
-            next.limiterThreshold = patch.limiterThreshold;
-        }
+        if (patch.loudness !== undefined) next.loudness = S.sanitizeUnit(patch.loudness, next.loudness);
+        if (patch.density !== undefined) next.density = S.sanitizeUnit(patch.density, next.density);
         if (patch.eqGains !== undefined) {
             next.eqGains = S.sanitizeEqGains(patch.eqGains);
         }
@@ -872,7 +1093,7 @@
 
         const advancedPatch = {};
         let hasAdvanced = false;
-        S.ADVANCED_KEYS.concat(['limiterIsp', 'ottLinearPhase']).forEach((key) => {
+        S.ADVANCED_ALL_KEYS.forEach((key) => {
             if (patch[key] !== undefined) {
                 advancedPatch[key] = patch[key];
                 hasAdvanced = true;
@@ -890,7 +1111,7 @@
             // Flush the look-ahead so the limiter does not replay stale audio
             // from before the switch.
             if (STATE.limiter) STATE.limiter.node.port.postMessage({ type: 'reset' });
-            if (STATE.ott) STATE.ott.node.port.postMessage({ type: 'reset' });
+            if (STATE.dynamics) STATE.dynamics.node.port.postMessage({ type: 'reset' });
         }
         if (routingChanged) updateRouting();
         applySettingsToGraph(next, false);
@@ -913,6 +1134,7 @@
     function startMeters() {
         if (STATE.meterTimer || !STATE.inputAnalyser) return;
 
+        setWorkletMetering(true);
         const buffer = new Float32Array(METER_FFT_SIZE);
         STATE.meterTimer = setInterval(() => {
             if (STATE.meterPorts.size === 0) {
@@ -920,22 +1142,41 @@
                 return;
             }
 
+            const agc = STATE.agcReading;
             const message = {
                 type: 'meters',
                 inputDb: analyserPeakDb(STATE.inputAnalyser, buffer),
-                outputDb: analyserPeakDb(STATE.outputAnalyser, buffer)
+                outputDb: analyserPeakDb(STATE.outputAnalyser, buffer),
+                agcGainDb: agc ? agc.gainDb : 0,
+                agcGate: agc ? agc.gate : 0,
+                limiterReductionDb: STATE.limiterReductionDb
             };
 
             STATE.meterPorts.forEach((port) => {
                 try { port.postMessage(message); } catch (_) {}
             });
         }, METER_INTERVAL_MS);
+        updateAnalyserTaps();
     }
 
     function stopMeters() {
         if (!STATE.meterTimer) return;
         clearInterval(STATE.meterTimer);
         STATE.meterTimer = null;
+        setWorkletMetering(false);
+        updateAnalyserTaps();
+    }
+
+    // The worklets only post readings while asked to, so a page nobody is
+    // looking at does no message traffic on the audio thread.
+    function setWorkletMetering(on) {
+        [STATE.dynamics, STATE.limiter].forEach((stage) => {
+            if (stage) stage.node.port.postMessage({ type: 'meters', on });
+        });
+        if (!on) {
+            STATE.agcReading = null;
+            STATE.limiterReductionDb = 0;
+        }
     }
 
     /* ---------------------------------------------------------------- init */
@@ -1002,6 +1243,7 @@
         browser.runtime.onConnect.addListener(handleConnect);
 
         STATE.observer = new MutationObserver(handleMutations);
+        document.addEventListener('visibilitychange', onVisibilityChange);
 
         // Also before the first await: page scripts start running as soon as we
         // yield, and any shadow root they attach before the hook is in place
@@ -1022,35 +1264,46 @@
         // the exemption list changes.
         if (await isPageExempted(exemptedSites)) {
             STATE.inert = true;
+            STATE.decided = true;
+            STATE.earlyRoots = [];
+            STATE.observer.disconnect();
             if (restoreAttachShadow) restoreAttachShadow();
             console.info('ThunderFox: site is exempted, staying inert', {
                 hostname: window.location.hostname
             });
             return;
         }
+        STATE.decided = true;
 
         STATE.settings = Object.assign({}, S.DEFAULTS, S.sanitizeAdvanced(stored), {
             enabled: !!stored.enabled,
             hpEnabled: !!stored.hpEnabled,
             eqEnabled: stored.eqEnabled === undefined ? true : !!stored.eqEnabled,
             advancedEnabled: !!stored.advancedEnabled,
-            limiterThreshold: typeof stored.limiterThreshold === 'number'
-                ? stored.limiterThreshold
-                : S.DEFAULTS.limiterThreshold,
+            loudness: S.sanitizeUnit(stored.loudness, S.DEFAULTS.loudness),
+            density: S.sanitizeUnit(stored.density, S.DEFAULTS.density),
             eqGains: S.sanitizeEqGains(stored.eqGains)
         });
 
         // Clear any stale "audio blocked" flag for this host. If the page is
         // still broken the watchdog re-raises it within a couple of seconds, so
         // the notice reflects this load rather than a previous one.
-        if (stored.audioBlockedHost === window.location.hostname) {
-            browser.storage.local.set({ audioBlockedHost: '' }).catch(() => {});
-        }
+        if (stored.audioBlockedHost === window.location.hostname) clearBlockedFlag();
 
         // document is observed rather than documentElement, which document.write
         // can replace and orphan.
         observeRoot(document);
         scan(document);
+
+        // Shadow roots attached while the exemption check was running. Their
+        // hosts may not be in the document yet, so the scan above cannot be
+        // relied on to reach them.
+        const early = STATE.earlyRoots;
+        STATE.earlyRoots = [];
+        early.forEach((root) => {
+            observeRoot(root);
+            scan(root);
+        });
     }
 
     // Fire up the bass cannon

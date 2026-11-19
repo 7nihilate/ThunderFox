@@ -2,6 +2,9 @@
 <html>
 <head>
     <meta charset="utf-8">
+    <!-- Desktop ignores this. Firefox for Android shows the popup as a full
+         page, so lay it out at the popup's own width and scale it to fit. -->
+    <meta name="viewport" content="width=260">
     <title>ThunderFox - by 7nihilate</title>
     <link rel="stylesheet" href="popup.css">
 </head>
@@ -29,6 +32,10 @@
                 <div class="meter"><i id="meterOutput" class="meter-out"></i></div>
                 <span class="meter-value" id="meterOutput-value">-&#8734;</span>
             </div>
+            <div class="meter-readings">
+                <span>Auto level <b id="agcReading">0.0 dB</b></span>
+                <span>Limiter <b id="grReading">0.0 dB</b></span>
+            </div>
         </div>
 
         <div class="controls">
@@ -41,6 +48,12 @@
                 <input id="loudness" type="range" min="0" max="100" step="1"
                        aria-describedby="loudness-value">
                 <span class="adv-value" id="loudness-value"></span>
+            </div>
+            <div class="row">
+                <label for="density">Density</label>
+                <input id="density" type="range" min="0" max="100" step="1"
+                       aria-describedby="density-value">
+                <span class="adv-value" id="density-value"></span>
             </div>
 
             <div class="eq-section">

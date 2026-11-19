@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "ThunderFox Audio Enhancer",
-  "version": "0.7.0",
-  "description": "Multiband upward/downward compression, an equaliser and a look-ahead brickwall limiter for web audio.",
+  "version": "0.8.0",
+  "description": "Auto level, a three-band compressor, an equaliser and a look-ahead brickwall limiter for web audio.",
   "action": {
     "default_title": "ThunderFox Audio Enhancer",
     "default_popup": "popup/popup.html"
@@ -37,7 +37,7 @@
   "web_accessible_resources": [
     {
       "resources": [
-        "content/ott-processor.js",
+        "content/dynamics-processor.js",
         "content/limiter-processor.js"
       ],
       "matches": ["<all_urls>"]
@@ -50,6 +50,9 @@
       "data_collection_permissions": {
         "required": ["none"]
       }
+    },
+    "gecko_android": {
+      "strict_min_version": "128.0"
     }
   }
 }

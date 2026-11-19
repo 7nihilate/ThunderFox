@@ -131,6 +131,32 @@ function noise(seconds, rate, seed) {
     return out;
 }
 
+// Deterministic pink (1/f) noise at the given RMS level in dBFS: white noise
+// through a sum of one-pole lowpasses spaced to approximate -3 dB/octave
+// across the audio band. Equal energy per octave, so every band of a
+// multiband split gets a comparable share, as with most music.
+function pink(seconds, rate, rmsDb, seed) {
+    const white = noise(seconds, rate, seed);
+    const out = new Float32Array(white.length);
+    let b0 = 0, b1 = 0, b2 = 0, b3 = 0, b4 = 0, b5 = 0, b6 = 0;
+    let sum = 0;
+    for (let i = 0; i < white.length; i++) {
+        const x = white[i];
+        b0 = 0.99886 * b0 + x * 0.0555179;
+        b1 = 0.99332 * b1 + x * 0.0750759;
+        b2 = 0.96900 * b2 + x * 0.1538520;
+        b3 = 0.86650 * b3 + x * 0.3104856;
+        b4 = 0.55000 * b4 + x * 0.5329522;
+        b5 = -0.7616 * b5 - x * 0.0168980;
+        out[i] = b0 + b1 + b2 + b3 + b4 + b5 + b6 + x * 0.5362;
+        b6 = x * 0.115926;
+        sum += out[i] * out[i];
+    }
+    const scale = dbToGain(rmsDb) / Math.sqrt(sum / out.length);
+    for (let i = 0; i < out.length; i++) out[i] *= scale;
+    return out;
+}
+
 // Dense programme material, normalised to a peak of 1: a sustained chord and
 // a noise floor, a kick on every beat and a noise burst on every off-beat.
 // The hits stand 12 dB or so above the bed, so a limiter driven by this has
@@ -429,6 +455,118 @@ function gainPumping(gainDb, rate, settleSeconds) {
     return { swingDb: max - min, riseDb: rise };
 }
 
+/**
+ * The strongest amplitude-modulation sideband of a carrier at `f0`, in dB
+ * relative to the carrier: Goertzel power at f0 +/- each offset. The window
+ * must be long enough to resolve the offsets (bin spacing rate / n).
+ */
+function sidebandDb(signal, f0, rate, offsetsHz, from, to) {
+    const carrier = power(signal, f0, rate, from, to);
+    let worst = 0;
+    offsetsHz.forEach((offset) => {
+        worst = Math.max(worst,
+            power(signal, f0 - offset, rate, from, to),
+            power(signal, f0 + offset, rate, from, to));
+    });
+    return carrier > 0 && worst > 0 ? 10 * Math.log10(worst / carrier) : -Infinity;
+}
+
+// A 4th-order Butterworth high-pass (two RBJ sections), returned as a new
+// signal. Used to find clicks: a steady low tone leaves almost nothing above
+// a high cutoff, a discontinuity leaves a spike.
+function highpass(signal, rate, cutoffHz) {
+    const out = Float64Array.from(signal);
+    [0.5411961, 1.3065630].forEach((q) => {
+        const w0 = (2 * Math.PI * cutoffHz) / rate;
+        const cos = Math.cos(w0);
+        const alpha = Math.sin(w0) / (2 * q);
+        const a0 = 1 + alpha;
+        const b0 = ((1 + cos) / 2) / a0;
+        const b1 = -(1 + cos) / a0;
+        const b2 = b0;
+        const a1 = (-2 * cos) / a0;
+        const a2 = (1 - alpha) / a0;
+        let z1 = 0;
+        let z2 = 0;
+        for (let i = 0; i < out.length; i++) {
+            const x = out[i];
+            const y = b0 * x + z1;
+            z1 = b1 * x - a1 * y + z2;
+            z2 = b2 * x - a2 * y;
+            out[i] = y;
+        }
+    });
+    return out;
+}
+
+// Peak of the signal above `cutoffHz`, over [from, to).
+function highpassPeak(signal, rate, cutoffHz, from, to) {
+    return peak(highpass(signal, rate, cutoffHz), from, to);
+}
+
+/**
+ * SMPTE-style intermodulation: a low tone and a high tone, and the products
+ * at fHigh +/- n * fLow for n = 1..orders, summed, relative to the high tone.
+ */
+function imdSmpteDb(signal, fLow, fHigh, rate, from, to, orders) {
+    const carrier = power(signal, fHigh, rate, from, to);
+    let sum = 0;
+    for (let n = 1; n <= (orders || 3); n++) {
+        sum += power(signal, fHigh - n * fLow, rate, from, to);
+        sum += power(signal, fHigh + n * fLow, rate, from, to);
+    }
+    return carrier > 0 && sum > 0 ? 10 * Math.log10(sum / carrier) : -Infinity;
+}
+
+/**
+ * Twin-tone (CCIF-style) intermodulation: the difference tone f2 - f1 and
+ * the third-order products 2f1 - f2 and 2f2 - f1, summed, relative to the
+ * mean power of the two tones.
+ */
+function twinToneImdDb(signal, f1, f2, rate, from, to) {
+    const tones = (power(signal, f1, rate, from, to) + power(signal, f2, rate, from, to)) / 2;
+    const products = [f2 - f1, 2 * f1 - f2, 2 * f2 - f1]
+        .filter((f) => f > 0 && f < rate / 2)
+        .reduce((sum, f) => sum + power(signal, f, rate, from, to), 0);
+    return tones > 0 && products > 0 ? 10 * Math.log10(products / tones) : -Infinity;
+}
+
+// The p-th percentile (0..1) of a list of numbers.
+function percentile(values, p) {
+    const sorted = Array.from(values).sort((a, b) => a - b);
+    if (sorted.length === 0) return NaN;
+    return sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))];
+}
+
+function mean(values) {
+    let sum = 0;
+    for (let i = 0; i < values.length; i++) sum += values[i];
+    return values.length > 0 ? sum / values.length : NaN;
+}
+
+// RMS level of `a` over `b` in dB, over [from, to).
+function channelRatioDb(a, b, from, to) {
+    return gainToDb(rms(a, from, to) / rms(b, from, to));
+}
+
+/**
+ * How far `b` departs from `scale * a`, as the RMS of the difference
+ * relative to the RMS of `b`, in dB. Two channels that keep the same image
+ * through a processor read far down.
+ */
+function residualDb(a, b, scale, from, to) {
+    const end = to === undefined ? a.length : to;
+    const start = from || 0;
+    let diff = 0;
+    let ref = 0;
+    for (let i = start; i < end; i++) {
+        const d = b[i] - scale * a[i];
+        diff += d * d;
+        ref += b[i] * b[i];
+    }
+    return ref > 0 && diff > 0 ? 10 * Math.log10(diff / ref) : -Infinity;
+}
+
 function rippleDb(track, fromTime, toTime) {
     const points = track.filter((p) => p.time >= fromTime && p.time < toTime && !isNaN(p.db));
     if (points.length === 0) return NaN;
@@ -451,6 +589,7 @@ module.exports = {
     squareBandlimited,
     multitone,
     noise,
+    pink,
     drumsOverBed,
     concat,
     stereo,
@@ -468,5 +607,14 @@ module.exports = {
     gainRoughness,
     truePeak,
     gainPumping,
+    sidebandDb,
+    highpass,
+    highpassPeak,
+    imdSmpteDb,
+    twinToneImdDb,
+    percentile,
+    mean,
+    channelRatioDb,
+    residualDb,
     rippleDb
 };

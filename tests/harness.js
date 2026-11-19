@@ -16,8 +16,22 @@ const vm = require('vm');
 const RENDER_QUANTUM = 128;
 const ROOT = path.resolve(__dirname, '..');
 
-function loadProcessor(relativePath, sampleRate) {
-    const source = fs.readFileSync(path.join(ROOT, relativePath), 'utf8');
+// Counts fresh loads, so each one's source is unique.
+let freshLoads = 0;
+
+/**
+ * `fresh` gives the file a unique trailing comment. V8 caches compiled code
+ * by source text, and with it the record of how often each function has
+ * been deoptimised; a function deoptimised often enough is never optimised
+ * again, in any context that shares that source. A test that measures speed
+ * or allocation wants the code as a page that only ever plays audio would
+ * get it, not as every other test has left it.
+ */
+function loadProcessor(relativePath, sampleRate, fresh) {
+    let source = fs.readFileSync(path.join(ROOT, relativePath), 'utf8');
+    if (fresh) source += `
+// fresh load ${++freshLoads}
+`;
     const registered = {};
 
     class AudioWorkletProcessor {
@@ -91,8 +105,76 @@ function loadProcessor(relativePath, sampleRate) {
             }
 
             return output;
+        },
+
+        /**
+         * A browser-like render loop over a chain of processors of this and
+         * other loaded types: `stages` is an array of { processor, params }
+         * (params as numbers only), and each stage's output feeds the next.
+         * Every block view and parameter array is built before the loop, so
+         * the loop itself allocates nothing, as on the audio thread. With
+         * `timed`, the time each quantum took through the whole chain is
+         * recorded, in milliseconds.
+         */
+        runChain(stages, input, timed) {
+            return runChain(stages, input, timed);
         }
     };
 }
 
-module.exports = { loadProcessor, RENDER_QUANTUM };
+function runChain(stages, input, timed) {
+    return prepareChain(stages, input).run(timed);
+}
+
+/**
+ * Everything runChain needs, built up front, and a run(timed) that does only
+ * the render loop: so a test can measure what the loop alone allocates. Each
+ * run continues from the processors' current state.
+ */
+function prepareChain(stages, input) {
+    const channels = input.length;
+    const length = input[0].length;
+    const blocks = Math.ceil(length / RENDER_QUANTUM);
+
+    // One output buffer per stage, and per block the views into each.
+    const buffers = stages.map(() => {
+        const out = [];
+        for (let c = 0; c < channels; c++) out.push(new Float32Array(length));
+        return out;
+    });
+    const views = [];
+    for (let k = 0; k < blocks; k++) {
+        const start = k * RENDER_QUANTUM;
+        const end = Math.min(length, start + RENDER_QUANTUM);
+        const stageViews = [[input.map((ch) => ch.subarray(start, end))]];
+        buffers.forEach((out) => stageViews.push([out.map((ch) => ch.subarray(start, end))]));
+        views.push(stageViews);
+    }
+    const paramSets = stages.map((stage) => {
+        const arrays = {};
+        const descriptors = stage.processor.constructor.parameterDescriptors;
+        descriptors.forEach((d) => {
+            const value = stage.params && stage.params[d.name] !== undefined ? stage.params[d.name] : d.defaultValue;
+            arrays[d.name] = new Float32Array([value]);
+        });
+        return arrays;
+    });
+
+    const now = typeof performance !== 'undefined' ? () => performance.now() : null;
+    return {
+        run(timed) {
+            const times = timed ? new Float64Array(blocks) : null;
+            for (let k = 0; k < blocks; k++) {
+                const stageViews = views[k];
+                const begin = timed ? now() : 0;
+                for (let s = 0; s < stages.length; s++) {
+                    stages[s].processor.process(stageViews[s], stageViews[s + 1], paramSets[s]);
+                }
+                if (timed) times[k] = now() - begin;
+            }
+            return { output: buffers[buffers.length - 1], outputs: buffers, times };
+        }
+    };
+}
+
+module.exports = { loadProcessor, runChain, prepareChain, RENDER_QUANTUM };

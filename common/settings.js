@@ -31,79 +31,105 @@ var ThunderFoxSettings = (function() {
     const HIGHPASS_Q = Math.SQRT1_2;
     const HIGHPASS_HZ = 200;
 
-    // The Loudness slider's own scale. Stored negated as `limiterThreshold` for
-    // compatibility with settings written by earlier versions.
-    const MAX_LOUDNESS_DB = 30;
+    // The Loudness slider sets the AGC's loudness target, in LUFS. The top is
+    // kept well short of 0 so that the final limiter only ever catches stray
+    // peaks: everything louder than this would have to come from limiting.
+    const MIN_TARGET_LUFS = -30;
+    const MAX_TARGET_LUFS = -12;
+
+    const BAND_KEYS = ['Low', 'Mid', 'High'];
 
     const DEFAULTS = {
         enabled: true,
         hpEnabled: false,
         eqEnabled: true,
-        limiterThreshold: -12,
+        nrEnabled: false,
+        // 0..1 slider positions. Loudness 0.7 is a target of about -17.4
+        // LUFS; Density 0.5 is 2:1 in every band.
+        loudness: 0.7,
+        density: 0.5,
         eqGains: [0, 0, 0, 0, 0, 0, 0, 0],
         advancedEnabled: false,
 
         preBoostDb: 0,
 
-        // The OTT-style stock preset at half depth: full mix, both directions
-        // at 1x, knobs at their base times, band ratios 0.8 up and
-        // 0.9/0.857/1.0 down, band gains +16.3/+11.7/+16.3 dB. The band gain
-        // is scaled by Depth inside the worklet, so the Loudness macro's low
-        // end stays gentle.
-        ottDepth: 0.5,
-        ottMix: 1,
-        ottAttack: 0.5,
-        ottRelease: 0.5,
-        ottUpward: 1,
-        ottDownward: 1,
-        ottLowCrossHz: 120,
-        ottHighCrossHz: 5000,
-        ottLowUp: 0.8,
-        ottLowDown: 0.9,
-        ottLowGainDb: 16.3,
-        ottMidUp: 0.8,
-        ottMidDown: 0.857,
-        ottMidGainDb: 11.7,
-        ottHighUp: 0.8,
-        ottHighDown: 1,
-        ottHighGainDb: 16.3,
+        // Auto level. The gate is relative to the programme's own recent
+        // level: a drop deeper than this freezes the gain.
+        agcEnabled: true,
+        agcMaxBoostDb: 15,
+        agcMaxCutDb: 20,
+        agcSpeed: 0.5,
+        agcGateDb: -20,
 
-        // Linear-phase band split: complementary FIR pairs instead of the IIR
-        // tree. Costs latency (~11 ms at the stock crossovers) and CPU, so it
-        // is opt-in.
-        ottLinearPhase: false,
+        crossLowHz: 150,
+        crossHighHz: 2500,
+
+        // Band riders: attack and release are time knobs (0.5 is the base,
+        // the ends are 4x faster and 4x slower).
+        bandAttack: 0.5,
+        bandRelease: 0.5,
+        bandMaxGainDb: 12,
+
+        // Noise reduction: the threshold is a band peak level before the
+        // auto level; the floor is the deepest cut.
+        nrThresholdDb: -55,
+        nrFloorDb: 12,
+        nrSpeed: 0.5,
+
+        bandLowThresholdDb: 0,
+        bandLowGainDb: 0,
+        bandLowNrOffsetDb: 0,
+        bandMidThresholdDb: 0,
+        bandMidGainDb: 0,
+        bandMidNrOffsetDb: 0,
+        bandHighThresholdDb: 0,
+        bandHighGainDb: 0,
+        bandHighNrOffsetDb: 0,
 
         limiterAttackMs: 5,
         limiterReleaseMs: 80,
         limiterHoldMs: 20,
         limiterCeilingDb: -0.3,
-        limiterIsp: true
+        limiterIsp: true,
+
+        // The audio buffer the AudioContext asks for. 'auto' is 'balanced'
+        // on Android and 'low' elsewhere; see AUDIO_LATENCY_HINTS.
+        audioLatency: 'auto'
     };
 
-    // unit drives both the slider mapping and the readout: 'db' and 'percent'
-    // are linear; 'ms' and 'hz' are logarithmic because those ranges span three
-    // orders of magnitude and a linear slider buries everything useful in the
-    // first pixels. The crossover range is 20 Hz - 18 kHz on both.
+    // unit drives both the slider mapping and the readout: 'db', 'percent'
+    // and 'lu' are linear; 'ms' and 'hz' are logarithmic because those ranges
+    // span three orders of magnitude and a linear slider buries everything
+    // useful in the first pixels. The crossover range is 20 Hz - 18 kHz on
+    // both.
     const LIMITS = {
         preBoostDb: { min: 0, max: 24, unit: 'db' },
 
-        ottDepth: { min: 0, max: 1, unit: 'percent' },
-        ottMix: { min: 0, max: 1, unit: 'percent' },
-        ottAttack: { min: 0, max: 1, unit: 'percent' },
-        ottRelease: { min: 0, max: 1, unit: 'percent' },
-        ottUpward: { min: 0, max: 2, unit: 'percent' },
-        ottDownward: { min: 0, max: 2, unit: 'percent' },
-        ottLowCrossHz: { min: 20, max: 18000, unit: 'hz' },
-        ottHighCrossHz: { min: 20, max: 18000, unit: 'hz' },
-        ottLowUp: { min: 0, max: 1, unit: 'percent' },
-        ottLowDown: { min: 0, max: 1, unit: 'percent' },
-        ottLowGainDb: { min: -30, max: 30, unit: 'db' },
-        ottMidUp: { min: 0, max: 1, unit: 'percent' },
-        ottMidDown: { min: 0, max: 1, unit: 'percent' },
-        ottMidGainDb: { min: -30, max: 30, unit: 'db' },
-        ottHighUp: { min: 0, max: 1, unit: 'percent' },
-        ottHighDown: { min: 0, max: 1, unit: 'percent' },
-        ottHighGainDb: { min: -30, max: 30, unit: 'db' },
+        agcMaxBoostDb: { min: 0, max: 24, unit: 'db' },
+        agcMaxCutDb: { min: 0, max: 30, unit: 'db' },
+        agcSpeed: { min: 0, max: 1, unit: 'percent' },
+        agcGateDb: { min: -40, max: -6, unit: 'lu' },
+
+        crossLowHz: { min: 20, max: 18000, unit: 'hz' },
+        crossHighHz: { min: 20, max: 18000, unit: 'hz' },
+
+        bandAttack: { min: 0, max: 1, unit: 'percent' },
+        bandRelease: { min: 0, max: 1, unit: 'percent' },
+        bandMaxGainDb: { min: 0, max: 20, unit: 'db' },
+
+        nrThresholdDb: { min: -80, max: -30, unit: 'db' },
+        nrFloorDb: { min: 0, max: 24, unit: 'db' },
+        nrSpeed: { min: 0, max: 1, unit: 'percent' },
+
+        bandLowThresholdDb: { min: -12, max: 12, unit: 'db' },
+        bandLowGainDb: { min: -12, max: 12, unit: 'db' },
+        bandLowNrOffsetDb: { min: -12, max: 12, unit: 'db' },
+        bandMidThresholdDb: { min: -12, max: 12, unit: 'db' },
+        bandMidGainDb: { min: -12, max: 12, unit: 'db' },
+        bandMidNrOffsetDb: { min: -12, max: 12, unit: 'db' },
+        bandHighThresholdDb: { min: -12, max: 12, unit: 'db' },
+        bandHighGainDb: { min: -12, max: 12, unit: 'db' },
+        bandHighNrOffsetDb: { min: -12, max: 12, unit: 'db' },
 
         limiterAttackMs: { min: 0.2, max: 5, unit: 'ms' },
         limiterReleaseMs: { min: 10, max: 1000, unit: 'ms' },
@@ -111,15 +137,47 @@ var ThunderFoxSettings = (function() {
         limiterCeilingDb: { min: -3, max: 0, unit: 'db' }
     };
 
+    // Advanced-only booleans, sanitised alongside the LIMITS keys. Noise
+    // reduction lives under Advanced too, so it is off whenever Advanced is.
+    const ADVANCED_FLAGS = ['agcEnabled', 'nrEnabled', 'limiterIsp'];
+
+    // Advanced-only choices: the allowed values, the first being the default.
+    const ADVANCED_CHOICES = {
+        audioLatency: ['auto', 'low', 'balanced', 'stable']
+    };
+
+    // What each audioLatency choice asks the AudioContext for. A bigger
+    // buffer survives a busy or slow device without underruns, at the cost
+    // of output latency, which the page's video does not know about and so
+    // shows up as audio lagging the picture: 'interactive' is typically
+    // 10-20 ms, 'balanced' 20-40 ms and 'playback' 40-100+ ms, depending on
+    // the device.
+    const AUDIO_LATENCY_HINTS = {
+        low: 'interactive',
+        balanced: 'balanced',
+        stable: 'playback'
+    };
+
+    // Keys earlier versions stored that nothing reads any more. The
+    // background page removes them after migrating.
+    const REMOVED_KEYS = [
+        'crossMidHz',
+        'bandLowMidThresholdDb', 'bandLowMidGainDb', 'bandLowMidNrOffsetDb',
+        'bandHighMidThresholdDb', 'bandHighMidGainDb', 'bandHighMidNrOffsetDb'
+    ];
+
     // Advanced-only keys: when the Advanced switch is off these revert to
     // DEFAULTS while the user's own values stay in storage.
     const ADVANCED_KEYS = Object.keys(LIMITS);
+
+    // Every key the Advanced switch governs, of all three kinds.
+    const ADVANCED_ALL_KEYS = ADVANCED_KEYS.concat(ADVANCED_FLAGS, Object.keys(ADVANCED_CHOICES));
 
     // Bumped whenever a default changes in a way stored values should follow.
     // Stored values silently override DEFAULTS, so without this a changed
     // default only ever reaches fresh installs. Storage that predates the key
     // is version 0.
-    const SETTINGS_VERSION = 5;
+    const SETTINGS_VERSION = 7;
 
     function clamp(value, min, max) {
         return Math.max(min, Math.min(max, value));
@@ -135,16 +193,12 @@ var ThunderFoxSettings = (function() {
     // value the user set deliberately is theirs, even if it happens to be the
     // old default, and there is no way to tell the two apart, so equality is
     // the honest cut.
+    //
+    // Migrations 0 -> 1, 2 -> 3 and 3 -> 4 tuned the OTT-style multiband stage,
+    // which version 6 replaced; their keys are no longer read, so they are
+    // kept only as no-ops to preserve the numbering.
     const MIGRATIONS = [
-        // 0 -> 1: per-band Up and Down defaults moved from 100% to 80%.
-        (stored) => {
-            const patch = {};
-            ['ottLowUp', 'ottLowDown', 'ottMidUp', 'ottMidDown', 'ottHighUp', 'ottHighDown']
-                .forEach((key) => {
-                    if (stored[key] === 1) patch[key] = DEFAULTS[key];
-                });
-            return patch;
-        },
+        () => ({}),
         // 1 -> 2: limiter hold default moved from 2 ms to 20 ms, long enough
         // to cover one half-cycle of bass so the gain no longer moves within a
         // cycle under sustained limiting.
@@ -153,44 +207,38 @@ var ThunderFoxSettings = (function() {
             if (stored.limiterHoldMs === 2) patch.limiterHoldMs = DEFAULTS.limiterHoldMs;
             return patch;
         },
-        // 2 -> 3: the multiband stage was rebuilt around the OTT-style stock
-        // preset. The Time knob split into Attack and Release (a set value
-        // carries over to both); the Down ratios, band gains, Depth and the
-        // limiter release moved to the stock preset where they still equal
-        // the old default.
-        (stored) => {
-            const patch = {};
-            if (isFiniteNumber(stored.ottTime) && stored.ottTime !== 0.5) {
-                patch.ottAttack = clamp(stored.ottTime, 0, 1);
-                patch.ottRelease = patch.ottAttack;
-            }
-            if (stored.ottDepth === 0.35) patch.ottDepth = DEFAULTS.ottDepth;
-            ['ottLowDown', 'ottMidDown', 'ottHighDown'].forEach((key) => {
-                if (stored[key] === 0.8) patch[key] = DEFAULTS[key];
-            });
-            ['ottLowGainDb', 'ottMidGainDb', 'ottHighGainDb'].forEach((key) => {
-                if (stored[key] === 0) patch[key] = DEFAULTS[key];
-            });
-            if (stored.limiterReleaseMs === 120) patch.limiterReleaseMs = DEFAULTS.limiterReleaseMs;
-            return patch;
-        },
-        // 3 -> 4: the Depth default moved from 100% to 50% and the mid/high
-        // crossover from 2.5 kHz to 5 kHz (less of the presence region rides
-        // the high band's faster envelope). The popup's log-scale slider can
-        // only ever store values like 2504, never exactly 2500, so equality
-        // still separates "never touched" from "set deliberately".
-        (stored) => {
-            const patch = {};
-            if (stored.ottDepth === 1) patch.ottDepth = DEFAULTS.ottDepth;
-            if (stored.ottHighCrossHz === 2500) patch.ottHighCrossHz = DEFAULTS.ottHighCrossHz;
-            return patch;
-        },
+        () => ({}),
+        () => ({}),
         // 4 -> 5: the limiter's smoothing became a triangular kernel and its
         // default width moved from 2.5 ms to the full 5 ms look-ahead, which
         // is the smoothest gain curve the look-ahead allows.
         (stored) => {
             const patch = {};
             if (stored.limiterAttackMs === 2.5) patch.limiterAttackMs = DEFAULTS.limiterAttackMs;
+            return patch;
+        },
+        // 5 -> 6: the multiband stage became auto level plus a four-band
+        // gain rider, and Loudness now sets a loudness target instead of
+        // driving the limiter. The old `limiterThreshold` and `ott*` values
+        // mean nothing to the new stage, so they are not carried over: the new
+        // keys start at their defaults.
+        () => ({}),
+        // 6 -> 7: four bands became three. A band's settings were tuned
+        // against the band it used to be, and the low and high bands now
+        // cover different ranges, so every band value and both crossovers go
+        // back to their defaults, whatever they were set to. The keys of the
+        // removed bands are listed in REMOVED_KEYS.
+        () => {
+            const patch = {
+                crossLowHz: DEFAULTS.crossLowHz,
+                crossHighHz: DEFAULTS.crossHighHz
+            };
+            BAND_KEYS.forEach((band) => {
+                ['ThresholdDb', 'GainDb', 'NrOffsetDb'].forEach((suffix) => {
+                    const key = `band${band}${suffix}`;
+                    patch[key] = DEFAULTS[key];
+                });
+            });
             return patch;
         }
     ];
@@ -217,21 +265,37 @@ var ThunderFoxSettings = (function() {
             const value = source && isFiniteNumber(source[key]) ? source[key] : DEFAULTS[key];
             result[key] = clamp(value, limits.min, limits.max);
         });
-        // Crossed crossovers would invert the mid band. Storage written by
-        // older versions allowed it, so swap rather than clamp: both chosen
-        // frequencies survive, in the only order the split makes sense in.
-        if (result.ottLowCrossHz > result.ottHighCrossHz) {
-            const swapped = result.ottLowCrossHz;
-            result.ottLowCrossHz = result.ottHighCrossHz;
-            result.ottHighCrossHz = swapped;
+        // Crossed crossovers would invert a band. Swap rather than clamp:
+        // both chosen frequencies survive, in the only order the split makes
+        // sense in.
+        if (result.crossLowHz > result.crossHighHz) {
+            const low = result.crossHighHz;
+            result.crossHighHz = result.crossLowHz;
+            result.crossLowHz = low;
         }
-        result.limiterIsp = source && typeof source.limiterIsp === 'boolean'
-            ? source.limiterIsp
-            : DEFAULTS.limiterIsp;
-        result.ottLinearPhase = source && typeof source.ottLinearPhase === 'boolean'
-            ? source.ottLinearPhase
-            : DEFAULTS.ottLinearPhase;
+        ADVANCED_FLAGS.forEach((key) => {
+            result[key] = source && typeof source[key] === 'boolean' ? source[key] : DEFAULTS[key];
+        });
+        Object.keys(ADVANCED_CHOICES).forEach((key) => {
+            const allowed = ADVANCED_CHOICES[key];
+            result[key] = source && allowed.includes(source[key]) ? source[key] : DEFAULTS[key];
+        });
         return result;
+    }
+
+    // The AudioContext latencyHint for a stored audioLatency choice. 'auto'
+    // takes the bigger buffer on Android, where the CPU is slower, the
+    // scheduler is less generous with the audio thread and a dropout is more
+    // likely than on a desktop.
+    function latencyHint(choice, isAndroid) {
+        const resolved = choice === 'auto' || !AUDIO_LATENCY_HINTS[choice]
+            ? (isAndroid ? 'balanced' : 'low')
+            : choice;
+        return AUDIO_LATENCY_HINTS[resolved];
+    }
+
+    function sanitizeUnit(value, fallback) {
+        return clamp(isFiniteNumber(value) ? value : fallback, 0, 1);
     }
 
     function sanitizeEqGains(value) {
@@ -245,28 +309,23 @@ var ThunderFoxSettings = (function() {
         return a + (b - a) * t;
     }
 
-    // Slider position as a 0..1 fraction, from the negated storage value.
-    function loudnessAmount(thresholdDb) {
-        const value = isFiniteNumber(thresholdDb) ? thresholdDb : DEFAULTS.limiterThreshold;
-        return clamp(-value, 0, MAX_LOUDNESS_DB) / MAX_LOUDNESS_DB;
+    /**
+     * Loudness sets the auto level's target. The band thresholds follow the
+     * target inside the worklet, so the whole chain moves together and the
+     * output keeps the same distance from the limiter's ceiling at every
+     * setting. Nothing drives the limiter any more.
+     */
+    function loudnessProfile(amount) {
+        const t = sanitizeUnit(amount, DEFAULTS.loudness);
+        return { targetLufs: lerp(MIN_TARGET_LUFS, MAX_TARGET_LUFS, t) };
     }
 
     /**
-     * One macro drives two things: how hard the multiband works, and how hard
-     * the result is pushed into a fixed ceiling. Both sit ahead of the limiter,
-     * so raising Loudness never adds gain after the only stage protecting the
-     * output.
-     *
-     * There is no dry/wet blend here. Depth is a gain-domain control inside the
-     * OTT worklet, so morphing it cannot comb-filter the way mixing a delayed
-     * wet path against a dry one would.
+     * Density is the band riders' ratio exponent q = 1 - 1/ratio: 0 leaves
+     * every band at unity, 0.5 is 2:1, 1 levels every band to its threshold.
      */
-    function loudnessProfile(amount) {
-        const t = clamp(amount, 0, 1);
-        return {
-            depth: lerp(0.15, 1, t),
-            driveDb: lerp(0, 24, t)
-        };
+    function densityProfile(amount) {
+        return { q: sanitizeUnit(amount, DEFAULTS.density) };
     }
 
     return {
@@ -276,16 +335,25 @@ var ThunderFoxSettings = (function() {
         EQ_GAIN_LIMIT,
         HIGHPASS_Q,
         HIGHPASS_HZ,
-        MAX_LOUDNESS_DB,
+        MIN_TARGET_LUFS,
+        MAX_TARGET_LUFS,
+        BAND_KEYS,
         DEFAULTS,
         LIMITS,
         ADVANCED_KEYS,
+        ADVANCED_FLAGS,
+        ADVANCED_CHOICES,
+        ADVANCED_ALL_KEYS,
+        AUDIO_LATENCY_HINTS,
+        REMOVED_KEYS,
         SETTINGS_VERSION,
         clamp,
+        latencyHint,
         migrateStored,
         sanitizeAdvanced,
         sanitizeEqGains,
-        loudnessAmount,
-        loudnessProfile
+        sanitizeUnit,
+        loudnessProfile,
+        densityProfile
     };
 })();

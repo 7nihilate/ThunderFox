@@ -39,6 +39,18 @@
  * a signal can pass between two samples and still reconstruct above the ceiling
  * in any downstream resampler or codec. See the ISP section below.
  *
+ * Cost. The interpolator is most of the per-sample work, and it is skipped
+ * exactly wherever it cannot matter: an interpolated value is a weighted sum
+ * of the last ISP_TAPS samples, so it is at most the sum of the absolute
+ * weights times the largest of them. Until a sample arrives that is loud
+ * enough for that bound to reach the ceiling, no inter-sample peak can, and
+ * an inter-sample peak at or under the ceiling never sets the reduction. With
+ * the chain ahead of the limiter keeping its peaks short of the ceiling,
+ * that is most of the time. And once the input has been silent for longer
+ * than the look-ahead and every part of the envelope is back at zero, a
+ * silent quantum is written out as silence without running the loop at all,
+ * leaving the state exactly as the loop would have.
+ *
  * The release. A single fast release is what makes a hard-driven limiter pump:
  * after every peak the gain races back up, the sustained material swells with
  * it, and the next peak pushes it down again. A single slow release avoids
@@ -112,6 +124,14 @@ const HOLD_TOLERANCE = 1e-9;
 // Rebuilding the boxcar sums periodically bounds the random walk that a
 // running add/subtract accumulator would otherwise accrue.
 const BOX_RESUM_INTERVAL = 1 << 16;
+
+// The reduction is kept in nepers (natural log of gain); this converts it to dB.
+const NEPER_TO_DB = 20 / Math.LN10;
+
+// A sample counts as loud enough to need the interpolator when its magnitude
+// times the interpolator's gain bound reaches the ceiling less this margin,
+// which covers rounding in the tap sums.
+const ISP_MARGIN = 1 + 1e-6;
 
 class BrickwallLimiterProcessor extends AudioWorkletProcessor {
     static get parameterDescriptors() {
@@ -222,9 +242,40 @@ class BrickwallLimiterProcessor extends AudioWorkletProcessor {
         this.historyPos = 0;
 
         this.ispCoefficients = BrickwallLimiterProcessor.buildIspCoefficients();
+        // The largest sum of absolute weights over the phases: no
+        // interpolated value can exceed this times the loudest tap.
+        this.ispBound = 0;
+        for (let phase = 0; phase < ISP_PHASES - 1; phase++) {
+            let sum = 0;
+            for (let k = 0; k < ISP_TAPS; k++) sum += Math.abs(this.ispCoefficients[phase * ISP_TAPS + k]);
+            if (sum > this.ispBound) this.ispBound = sum;
+        }
+        // Per channel: samples until the last loud one leaves the
+        // interpolator's window. Above zero, the interpolator runs.
+        this.ispCountdown = new Int32Array(0);
+        this.ispCeiling = -1;
+
+        // The silence fast path. zeroRun counts consecutive silent input
+        // samples (whole quanta only); settled is set once the smoothing
+        // rings have been checked to be all zero, and cleared by any quantum
+        // that runs the loop. fastPath exists so tests can switch it off and
+        // check the output and state are unchanged.
+        this.zeroRun = 0;
+        this.settled = false;
+        this.fastPath = true;
+
+        // The deepest reduction since it was last reported, in nepers. Kept
+        // for the popup's gain reduction readout and for tests; reported over
+        // the port only while the host has metering switched on.
+        this.peakReduction = 0;
+        this.metering = false;
+        this.meterCountdown = 0;
 
         this.port.onmessage = (event) => {
-            if (event.data && event.data.type === 'reset') this.reset();
+            const data = event.data;
+            if (!data) return;
+            if (data.type === 'reset') this.reset();
+            else if (data.type === 'meters') this.metering = !!data.on;
         };
 
         this.port.postMessage({
@@ -290,6 +341,9 @@ class BrickwallLimiterProcessor extends AudioWorkletProcessor {
         this.holdCountdown = 0;
         this.sampleIndex = 0;
         this.previousBetween = 0;
+        this.ispCountdown.fill(ISP_TAPS);
+        this.zeroRun = 0;
+        this.settled = false;
     }
 
     ensureChannels(channelCount) {
@@ -301,6 +355,7 @@ class BrickwallLimiterProcessor extends AudioWorkletProcessor {
             this.delay.push(new Float32Array(this.lookahead));
             this.history.push(new Float32Array(ISP_TAPS * 2));
         }
+        this.ispCountdown = new Int32Array(channelCount);
 
         // The envelope in flight was computed from audio that is no longer in
         // the delay line, so everything downstream of the detector has to go
@@ -414,12 +469,47 @@ class BrickwallLimiterProcessor extends AudioWorkletProcessor {
         // Hoisted out of the frame loop: an input can present fewer channels
         // than the output, and testing that per sample per channel is wasteful.
         const sourceChannels = input ? Math.min(input.length, channelCount) : 0;
+        let peakReduction = this.peakReduction;
+
+        // A lower ceiling can make samples already in the interpolator's
+        // window loud, so every channel recomputes until they have left it.
+        const ispCountdown = this.ispCountdown;
+        if (ceiling < this.ispCeiling) ispCountdown.fill(ISP_TAPS);
+        this.ispCeiling = ceiling;
+        const loudLevel = ceiling / (this.ispBound * ISP_MARGIN);
+        const ispAlways = !this.fastPath;
+
+        let silent = true;
+        for (let c = 0; c < sourceChannels && silent; c++) {
+            const source = input[c];
+            for (let i = 0; i < frames; i++) {
+                if (source[i] !== 0) { silent = false; break; }
+            }
+        }
+
+        if (silent && this.fastPath && !driveAutomated && driveValues[0] === drive
+            && this.zeroRun >= delayLength + ISP_TAPS
+            && this.fast === 0 && this.slow === 0 && this.sustain === 0
+            && this.previousBetween === 0 && this.envelopeSum === 0 && this.averageSum === 0
+            && this.ringsSettled()) {
+            this.skipSilence(frames, driveLog, driveDelay);
+            for (let c = 0; c < channelCount; c++) output[c].fill(0);
+            this.zeroRun += frames;
+            this.reportMeters(frames);
+            return true;
+        }
+        this.settled = false;
+        this.zeroRun = silent ? this.zeroRun + frames : 0;
+
+        const history = this.history;
+        const delay = this.delay;
+        let historyPos = this.historyPos;
 
         for (let i = 0; i < frames; i++) {
             // Push into the history ring, twice, so the tap loop below reads a
             // contiguous run. Then take the delayed sample the rest of the
             // algorithm treats as "now".
-            const historyRead = this.historyPos + 1;
+            const historyRead = historyPos + 1;
             let peak = 0;
             let between = 0;
 
@@ -438,17 +528,23 @@ class BrickwallLimiterProcessor extends AudioWorkletProcessor {
                 // the running sums permanently.
                 if (!(sample === sample)) sample = 0;
 
-                const ring = this.history[c];
-                ring[this.historyPos] = sample;
-                ring[this.historyPos + ISP_TAPS] = sample;
+                const ring = history[c];
+                ring[historyPos] = sample;
+                ring[historyPos + ISP_TAPS] = sample;
 
                 const delayed = ring[historyRead + ISP_CENTRE];
-                this.delay[c][this.delayPos] = delayed;
+                delay[c][this.delayPos] = delayed;
 
                 const magnitude = delayed < 0 ? -delayed : delayed;
                 if (magnitude > peak) peak = magnitude;
 
-                if (ispEnabled) {
+                // Read back from the ring: what the taps see is the sample
+                // rounded to single precision.
+                const stored = ring[historyPos];
+                if (stored > loudLevel || stored < -loudLevel) ispCountdown[c] = ISP_TAPS;
+                else if (ispCountdown[c] > 0) ispCountdown[c]--;
+
+                if (ispEnabled && (ispCountdown[c] > 0 || ispAlways)) {
                     for (let phase = 0; phase < ISP_PHASES - 1; phase++) {
                         const base = phase * ISP_TAPS;
                         let accumulator = 0;
@@ -461,7 +557,7 @@ class BrickwallLimiterProcessor extends AudioWorkletProcessor {
                 }
             }
 
-            this.historyPos = this.historyPos + 1 === ISP_TAPS ? 0 : this.historyPos + 1;
+            historyPos = historyPos + 1 === ISP_TAPS ? 0 : historyPos + 1;
 
             // A peak between two samples is shaped by the gain on both of
             // them, so it counts against the one before it and the one after.
@@ -560,20 +656,89 @@ class BrickwallLimiterProcessor extends AudioWorkletProcessor {
 
             const reduction = this.averageSum / boxLength;
             const gain = reduction > 0 ? Math.exp(-reduction) : 1;
+            if (reduction > peakReduction) peakReduction = reduction;
 
             const readPos = this.delayPos + 1 === delayLength ? 0 : this.delayPos + 1;
             for (let c = 0; c < channelCount; c++) {
-                output[c][i] = this.delay[c][readPos] * gain;
+                output[c][i] = delay[c][readPos] * gain;
             }
 
             this.delayPos = readPos;
             this.sampleIndex++;
         }
 
+        this.historyPos = historyPos;
         this.drive = drive;
         this.driveLog = driveLog;
+        this.peakReduction = peakReduction;
 
+        this.reportMeters(frames);
         return true;
+    }
+
+    reportMeters(frames) {
+        if (!this.metering) return;
+        this.meterCountdown -= frames;
+        if (this.meterCountdown <= 0) {
+            this.meterCountdown = Math.round(0.1 * sampleRate);
+            this.port.postMessage({ type: 'gr', db: this.peakReduction * NEPER_TO_DB });
+            this.peakReduction = 0;
+        }
+    }
+
+    // Whether both smoothing rings hold nothing but zeros. Checked once per
+    // stretch of silence, then remembered until the loop runs again.
+    ringsSettled() {
+        if (this.settled) return true;
+        const envelopeRing = this.envelopeRing;
+        const averageRing = this.averageRing;
+        for (let i = 0; i < envelopeRing.length; i++) {
+            if (envelopeRing[i] !== 0 || averageRing[i] !== 0) return false;
+        }
+        this.settled = true;
+        return true;
+    }
+
+    /**
+     * Advance the state over `frames` silent samples exactly as the loop in
+     * process() would, given that the history, delay and smoothing rings are
+     * all zero and so is every part of the envelope. The rings only move
+     * their positions; the drive ring is still written, since it may hold
+     * older drive values that have yet to come out.
+     */
+    skipSilence(frames, driveLog, driveDelay) {
+        this.historyPos = (this.historyPos + frames) % ISP_TAPS;
+        this.delayPos = (this.delayPos + frames) % this.lookahead;
+        this.ringPos = (this.ringPos + frames) % this.boxCapacity;
+
+        const driveRing = this.driveRing;
+        const driveCapacity = driveRing.length;
+        let drivePos = this.drivePos;
+        let delayedDriveLog = this.delayedDriveLog;
+        for (let i = 0; i < frames; i++) {
+            driveRing[drivePos] = driveLog;
+            let driveRead = drivePos - driveDelay;
+            if (driveRead < 0) driveRead += driveCapacity;
+            delayedDriveLog = driveRing[driveRead];
+            drivePos = drivePos + 1 === driveCapacity ? 0 : drivePos + 1;
+        }
+        this.drivePos = drivePos;
+        this.delayedDriveLog = delayedDriveLog;
+
+        for (let c = 0; c < this.ispCountdown.length; c++) {
+            this.ispCountdown[c] = Math.max(0, this.ispCountdown[c] - frames);
+        }
+        this.holdCountdown = Math.max(0, this.holdCountdown - frames);
+
+        let countdown = this.resumCountdown - frames;
+        while (countdown <= 0) countdown += BOX_RESUM_INTERVAL;
+        this.resumCountdown = countdown;
+
+        // The running maximum over zeros is one zero, the latest.
+        this.dequeCount = 1;
+        this.dequeValues[this.dequeHead] = 0;
+        this.dequeIndices[this.dequeHead] = this.sampleIndex + frames - 1;
+        this.sampleIndex += frames;
     }
 }
 

@@ -16,6 +16,10 @@ async function migrateSettings() {
     const patch = ThunderFoxSettings.migrateStored(stored);
     if (Object.keys(patch).length === 0) return;
     await browser.storage.local.set(patch);
+    // Keys nothing reads any more. Harmless if left, but they would sit in
+    // storage forever.
+    const stale = ThunderFoxSettings.REMOVED_KEYS.filter((key) => key in stored);
+    if (stale.length > 0) await browser.storage.local.remove(stale);
     console.info('ThunderFox: migrated settings to version', patch.settingsVersion);
 }
 
