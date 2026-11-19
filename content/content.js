@@ -1,112 +1,110 @@
 (function() {
-    // Values used when the Advanced section is switched off. The user's own
-    // settings stay in storage so toggling Advanced back on restores them.
-    const DEFAULT_DYNAMICS = {
-        preBoostDb: 6,
-        compAttackMs: 10,
-        compReleaseMs: 300,
-        limiterAttackMs: 3,
-        limiterReleaseMs: 100
-    };
+    const S = ThunderFoxSettings;
 
-    // limiterAttackMs is the limiter's gain-envelope smoothing width and cannot
-    // exceed the worklet's fixed 5 ms look-ahead.
-    const DYNAMICS_LIMITS = {
-        preBoostDb: { min: 0, max: 24 },
-        compAttackMs: { min: 0.1, max: 100 },
-        compReleaseMs: { min: 20, max: 1000 },
-        limiterAttackMs: { min: 0.2, max: 5 },
-        limiterReleaseMs: { min: 10, max: 500 }
-    };
-
-    // Gain staging. The band splitter reconstructs flat within 0.1 dB above
-    // 700 Hz but carries a gentle +3 dB shelf below 400 Hz, which the low trim
-    // cancels. Loudness comes from pre-boost, the band makeups and the drive
-    // control, all of which sit ahead of the limiter.
-    const BAND_TRIM_DB = { low: -3, mid: 0, high: 0 };
-    const MASTER_TRIM_DB = 0;
-    const MAX_DRIVE_DB = 30;
-    // Stored as a negative "threshold" for backwards compatibility with
-    // settings written by earlier versions; the magnitude is the drive in dB.
-    const DEFAULT_LIMITER_THRESHOLD = -12;
-
-    // Upward compression is slower than downward on purpose; a fast upward
-    // release is what makes quiet passages audibly breathe.
-    const UPWARD_ATTACK_SCALE = 3;
-    const UPWARD_RELEASE_SCALE = 2;
-
-    // Fixed wet mix of the two compressed paths. There is no dry path: the FIR
-    // band splitter and the look-ahead limiter both add delay, so blending dry
-    // against wet would comb-filter. Loudness morphs the compressor and drive
-    // parameters instead (see LOUDNESS_LIGHT / LOUDNESS_EXTREME).
-    const BLEND = { down: 0.65, up: 0.35 };
-
-    // Loudness 0% → light compression, light drive into the brickwall.
-    // Loudness 100% → strong upward/downward compression, heavy drive.
-    const LOUDNESS_LIGHT = {
-        downward: { thresholdDb: -6, kneeDb: 4, ratio: 2 },
-        upward: { thresholdDb: -18, kneeDb: 6, ratio: 2.5 },
-        driveDb: 0
-    };
-    const LOUDNESS_EXTREME = {
-        downward: { thresholdDb: -18, kneeDb: 8, ratio: 8 },
-        upward: { thresholdDb: -42, kneeDb: 12, ratio: 16 },
-        driveDb: MAX_DRIVE_DB
-    };
-
-    // The brickwall limiter cannot exceed this, so it is a true ceiling rather
-    // than a target. Left a little under 0 dBFS for inter-sample peaks, which
-    // a sample-domain limiter does not see.
-    const OUTPUT_CEILING_DB = -0.3;
+    const DYNAMICS_WORKLET_PATH = 'content/dynamics-processor.js';
+    const DYNAMICS_WORKLET_NAME = 'thunderfox-dynamics';
     const LIMITER_WORKLET_PATH = 'content/limiter-processor.js';
     const LIMITER_WORKLET_NAME = 'thunderfox-brickwall-limiter';
 
     const PARAM_SMOOTHING_SECONDS = 0.02;
 
+    // How long the summed input may read as digital silence while something is
+    // playing before we conclude the page's audio has been silenced rather than
+    // merely quiet.
+    const SILENCE_TIMEOUT_MS = 2000;
+    const WATCHDOG_INTERVAL_MS = 500;
+
+    const METER_FFT_SIZE = 4096;
+    const METER_INTERVAL_MS = 60;
+    const METER_FLOOR_DB = -60;
+
+    // How long a media element gets to reload under CORS before we decide the
+    // reload failed and hand it back its original, untouched load.
+    const CORS_RELOAD_TIMEOUT_MS = 10000;
+
+    // How long to wait for a suspended context to start before leaving an
+    // element alone for now. Taking an element's audio into a context that
+    // cannot run silences it, so if the browser will not let the context
+    // start (autoplay policy, stricter on Android) the element keeps playing
+    // natively until the next gesture.
+    const CONTEXT_START_TIMEOUT_MS = 300;
+
+    // With no tracked media playing for this long, the context is suspended
+    // so the audio thread and the output device can sleep. Resumed on the
+    // next `play`, which fires before any audio is rendered.
+    const IDLE_SUSPEND_MS = 30000;
+    const IDLE_CHECK_INTERVAL_MS = 5000;
+
+    // Firefox for Android. Content scripts have no runtime.getPlatformInfo.
+    const IS_ANDROID = /Android/i.test(navigator.userAgent);
+
     const STATE = {
         audioContext: null,
         contextReady: null,
-        pendingElements: new Set(),
-        mediaElToNodes: new Map(),
-        masterGain: null,
-        limiter: null,
-        enabled: true,
-        observer: null,
-        limiterThresholdDb: DEFAULT_LIMITER_THRESHOLD,
-        hpEnabled: false,
-        eqEnabled: true,
+        contextFailed: false,
+
+        inputGain: null,
+        preGain: null,
+        dynamics: null,
+        hpFilter: null,
         eq: null,
-        eqGains: [0, 0, 0, 0, 0, 0, 0, 0], // 8 bands, default 0 dB
-        advancedEnabled: false,
-        dynamics: Object.assign({}, DEFAULT_DYNAMICS)
+        limiter: null,
+        inputAnalyser: null,
+        outputAnalyser: null,
+
+        // Permanent. A MediaElementAudioSourceNode binds to its element for the
+        // life of the document and cannot be recreated, so an entry here is
+        // never deleted — only disconnected. Dropping it and letting the element
+        // come back is what used to mute it forever.
+        mediaNodes: new Map(),
+        wiring: new Set(),
+        skipped: new WeakSet(),
+        corsTried: new WeakSet(),
+        watched: new WeakSet(),
+        protectedElements: new WeakSet(),
+        observedRoots: new WeakSet(),
+
+        observer: null,
+        pendingRoots: new Set(),
+        scanTimer: null,
+        inert: false,
+        // Set once the exemption check has finished. Until then nothing is
+        // observed or touched: shadow roots the hook sees are only queued in
+        // earlyRoots, and handed over or dropped by the decision.
+        decided: false,
+        earlyRoots: [],
+
+        meterPorts: new Set(),
+        meterTimer: null,
+        // The latest readings the worklets posted while metering was on.
+        agcReading: null,
+        limiterReductionDb: 0,
+        watchdogTimer: null,
+        silenceSince: 0,
+        silenceReported: false,
+
+        // Whether each analyser is connected. They are only tapped while
+        // something reads them.
+        inputTapped: false,
+        outputTapped: false,
+
+        // Elements left playing natively because the context could not
+        // start when they began; retried once it can.
+        deferred: new Set(),
+        idleTimer: null,
+        idleSince: 0,
+        idleSuspended: false,
+
+        settings: Object.assign({}, S.DEFAULTS),
+        applied: {}
     };
 
     function dbToGain(db) {
         return Math.pow(10, db / 20);
     }
 
-    function clamp(value, min, max) {
-        return Math.max(min, Math.min(max, value));
-    }
-
     function msToSeconds(ms) {
-        return clamp(ms / 1000, 0, 1);
-    }
-
-    function sanitizeDynamics(source) {
-        const result = {};
-        Object.keys(DEFAULT_DYNAMICS).forEach((key) => {
-            const limits = DYNAMICS_LIMITS[key];
-            const value = source && typeof source[key] === 'number' && isFinite(source[key])
-                ? source[key]
-                : DEFAULT_DYNAMICS[key];
-            result[key] = clamp(value, limits.min, limits.max);
-        });
-        return result;
-    }
-
-    function effectiveDynamics() {
-        return STATE.advancedEnabled ? STATE.dynamics : DEFAULT_DYNAMICS;
+        return S.clamp(ms / 1000, 0, 1);
     }
 
     // Smoothed writes for anything in the signal path; assigning .value directly
@@ -122,550 +120,1066 @@
         param.setTargetAtTime(value, now, PARAM_SMOOTHING_SECONDS);
     }
 
-    // Web Audio's compression curve, used to derive makeup gains that exactly
-    // cancel each compressor's effect at 0 dBFS.
-    function compressorOutputDb(inputDb, thresholdDb, kneeDb, ratio) {
-        if (inputDb <= thresholdDb) return inputDb;
-        if (kneeDb > 0 && inputDb <= thresholdDb + kneeDb) {
-            const over = inputDb - thresholdDb;
-            return inputDb + ((1 / ratio - 1) * over * over) / (2 * kneeDb);
+    // Structural parameters — ones the worklet turns into a buffer length rather
+    // than a coefficient — must step, not ramp. Ramping the limiter's smoothing
+    // makes it a different integer on nearly every render quantum, which rebuilds
+    // the boxcar sum on the audio thread over and over.
+    function setParam(param, value) {
+        if (!param) return;
+        if (!STATE.audioContext) {
+            param.value = value;
+            return;
         }
-        return thresholdDb + kneeDb / 2 + kneeDb / (2 * ratio) + (inputDb - thresholdDb - kneeDb) / ratio;
+        const now = STATE.audioContext.currentTime;
+        param.cancelScheduledValues(now);
+        param.setValueAtTime(value, now);
     }
 
-    // Makeup that puts a full-scale input back at full scale, so the compressor
-    // only ever lifts what sits below its threshold. This is what turns a
-    // downward compressor into the upward-acting stage OTT-style processing
-    // depends on.
-    function unityMakeupDb(config) {
-        return -compressorOutputDb(0, config.thresholdDb, config.kneeDb, config.ratio);
-    }
+    /* ---------------------------------------------------------------- graph */
 
-    function lerp(a, b, t) {
-        return a + (b - a) * t;
-    }
-
-    // Slider position as a 0..1 fraction. Stored as a negative "threshold" for
-    // compatibility with settings written by earlier versions.
-    function loudnessAmount(thresholdDb) {
-        return clamp(-thresholdDb, 0, MAX_DRIVE_DB) / MAX_DRIVE_DB;
-    }
-
-    // Crossfade compressor and drive settings between light and extreme.
-    // Both wet paths share the FIR delay, so morphing parameters never
-    // introduces comb filtering the way a dry/wet mix would.
-    function loudnessProfile(amount) {
-        const t = clamp(amount, 0, 1);
-        const mix = (light, extreme) => ({
-            thresholdDb: lerp(light.thresholdDb, extreme.thresholdDb, t),
-            kneeDb: lerp(light.kneeDb, extreme.kneeDb, t),
-            ratio: lerp(light.ratio, extreme.ratio, t)
-        });
-        return {
-            downward: mix(LOUDNESS_LIGHT.downward, LOUDNESS_EXTREME.downward),
-            upward: mix(LOUDNESS_LIGHT.upward, LOUDNESS_EXTREME.upward),
-            driveDb: lerp(LOUDNESS_LIGHT.driveDb, LOUDNESS_EXTREME.driveDb, t)
-        };
-    }
-
-    function applyCompressorSettings(comp, makeup, config) {
-        if (!comp) return;
-        rampParam(comp.threshold, config.thresholdDb);
-        rampParam(comp.knee, config.kneeDb);
-        rampParam(comp.ratio, config.ratio);
-        if (makeup) rampParam(makeup.gain, dbToGain(unityMakeupDb(config)));
-    }
-
-    // Building the context is asynchronous now that the limiter is an
-    // AudioWorklet, so callers await a single shared promise.
     function ensureAudioContext() {
+        if (STATE.contextFailed) return Promise.reject(new Error('audio context unavailable'));
         if (!STATE.contextReady) STATE.contextReady = buildAudioContext();
         return STATE.contextReady;
     }
 
     async function buildAudioContext() {
-        const ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
+        // The buffer size is fixed for the life of the context, and the
+        // context for the life of the page: once an element's audio has been
+        // taken it cannot be moved to another one. So the choice applies from
+        // the next page load.
+        const advanced = effectiveAdvanced(STATE.settings);
+        const latencyHint = S.latencyHint(advanced.audioLatency, IS_ANDROID);
+        const ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint });
+
+        try {
+            // Both worklets or neither. A half-built chain — auto level and band
+            // gain with no limiter behind it, say — is worse than not
+            // processing at all.
+            await ctx.audioWorklet.addModule(browser.runtime.getURL(DYNAMICS_WORKLET_PATH));
+            await ctx.audioWorklet.addModule(browser.runtime.getURL(LIMITER_WORKLET_PATH));
+        } catch (error) {
+            STATE.contextFailed = true;
+            try { await ctx.close(); } catch (_) {}
+            console.warn('ThunderFox: audio worklets unavailable, leaving this page alone', error);
+            throw error;
+        }
+
         STATE.audioContext = ctx;
 
-        STATE.masterGain = ctx.createGain();
-        STATE.masterGain.gain.value = dbToGain(MASTER_TRIM_DB);
-        // Highpass filter placed after multiband output but before limiter (biquad, 200Hz)
-        STATE.hpFilter = createBiquadHighpass(ctx, 200);
-        // 8-band equalizer before limiter
-        STATE.eq = create8BandEQ(ctx);
-        STATE.limiter = await createLimiter(ctx);
+        STATE.inputGain = ctx.createGain();
+        STATE.preGain = ctx.createGain();
 
-        applyLoudness(STATE.limiterThresholdDb);
-        applyDynamics();
+        STATE.dynamics = createDynamics(ctx);
+        STATE.hpFilter = createHighpass(ctx);
+        STATE.eq = createEqualizer(ctx);
+        STATE.limiter = createLimiter(ctx);
 
-        // Wire DSP chain
-        updateDSPChain();
+        // Level meters are taken here rather than inside the worklets, so the
+        // audio thread does no metering work at all and the polling only runs
+        // while the popup is open. 4096 samples is 85 ms at 48 kHz, longer than
+        // the poll interval, so the windows overlap and no peak falls between
+        // two reads.
+        STATE.inputAnalyser = ctx.createAnalyser();
+        STATE.inputAnalyser.fftSize = METER_FFT_SIZE;
+        STATE.outputAnalyser = ctx.createAnalyser();
+        STATE.outputAnalyser.fftSize = METER_FFT_SIZE;
+
+        STATE.inputGain.connect(STATE.preGain);
+        STATE.preGain.connect(STATE.dynamics.node);
         STATE.limiter.output.connect(ctx.destination);
 
-        if (STATE.eq && STATE.eq.setGains) STATE.eq.setGains(STATE.eqGains);
+        updateRouting();
+        applySettingsToGraph(STATE.settings, true);
+
+        console.info('ThunderFox: audio context', {
+            latencyHint,
+            sampleRate: ctx.sampleRate,
+            baseLatency: ctx.baseLatency,
+            outputLatency: ctx.outputLatency
+        });
+
+        ctx.onstatechange = () => {
+            if (ctx.state === 'running') {
+                removeGestureListeners();
+                retryDeferred();
+            } else if (ctx.state === 'suspended' && !STATE.idleSuspended) {
+                // Suspended by the browser rather than by us (Android does
+                // this in the background): any gesture may bring it back.
+                installGestureListeners();
+            }
+        };
+        installGestureListeners();
+        resumeContext();
+
+        // A popup opened before anything played is already waiting for meters.
+        startMeters();
+
+        return ctx;
     }
 
-    function create8BandEQ(ctx) {
-        // Standard 8-band EQ frequencies (Hz)
-        const frequencies = [68, 147, 315, 678, 1464, 3153, 6787, 14635];
-        const Q = 1.0; // Quality factor for reasonable bandwidth
+    function createDynamics(ctx) {
+        const node = new AudioWorkletNode(ctx, DYNAMICS_WORKLET_NAME, {
+            numberOfInputs: 1,
+            numberOfOutputs: 1,
+            outputChannelCount: [2],
+            channelCount: 2,
+            channelCountMode: 'explicit',
+            channelInterpretation: 'speakers'
+        });
 
+        node.port.onmessage = (event) => {
+            const data = event.data;
+            if (data && data.type === 'agc') STATE.agcReading = data;
+        };
+
+        return { node, parameters: node.parameters };
+    }
+
+    function createHighpass(ctx) {
+        const filter = ctx.createBiquadFilter();
+        filter.type = 'highpass';
+        filter.frequency.value = S.HIGHPASS_HZ;
+        filter.Q.value = S.HIGHPASS_Q;
+        return filter;
+    }
+
+    function createEqualizer(ctx) {
         const input = ctx.createGain();
         const filters = [];
 
-        // Create 8 peaking filters in series
-        let currentNode = input;
-        frequencies.forEach((freq) => {
+        let current = input;
+        S.EQ_BANDS.forEach((band) => {
             const filter = ctx.createBiquadFilter();
-            filter.type = 'peaking';
-            filter.frequency.value = freq;
-            filter.Q.value = Q;
-            filter.gain.value = 0; // Default to 0 dB (no boost/cut)
-
-            currentNode.connect(filter);
-            currentNode = filter;
+            filter.type = band.type;
+            filter.frequency.value = band.frequency;
+            filter.Q.value = S.EQ_Q;
+            filter.gain.value = 0;
+            current.connect(filter);
+            current = filter;
             filters.push(filter);
         });
 
         return {
             input,
-            output: currentNode,
+            output: current,
             filters,
-            setGain: (bandIndex, gainDb) => {
-                if (bandIndex >= 0 && bandIndex < filters.length) {
-                    rampParam(filters[bandIndex].gain, gainDb);
-                }
-            },
             setGains: (gainsDb) => {
                 gainsDb.forEach((gainDb, index) => {
-                    if (index < filters.length) {
-                        rampParam(filters[index].gain, gainDb);
-                    }
+                    if (filters[index]) rampParam(filters[index].gain, gainDb);
                 });
             }
         };
     }
 
-    // A look-ahead brickwall limiter needs to see samples before they play,
-    // which no built-in node can do, so the real limiter lives in an
-    // AudioWorklet. If that cannot be loaded the chain still has to be safe,
-    // hence the compressor fallback below.
-    async function createBrickwallNode(ctx) {
-        try {
-            const url = browser.runtime.getURL(LIMITER_WORKLET_PATH);
-            await ctx.audioWorklet.addModule(url);
-
-            const node = new AudioWorkletNode(ctx, LIMITER_WORKLET_NAME, {
-                numberOfInputs: 1,
-                numberOfOutputs: 1,
-                parameterData: { ceiling: dbToGain(OUTPUT_CEILING_DB) }
-            });
-
-            return {
-                node,
-                brickwall: true,
-                setSmoothing: (seconds) => rampParam(node.parameters.get('smoothing'), seconds),
-                setRelease: (seconds) => rampParam(node.parameters.get('release'), seconds)
-            };
-        } catch (error) {
-            console.warn('ThunderFox: brickwall worklet unavailable, using compressor fallback', error);
-
-            const comp = ctx.createDynamicsCompressor();
-            comp.threshold.value = OUTPUT_CEILING_DB - 2;
-            comp.knee.value = 0;
-            comp.ratio.value = 20;
-            comp.attack.value = 0.001;
-            comp.release.value = msToSeconds(DEFAULT_DYNAMICS.limiterReleaseMs);
-
-            return {
-                node: comp,
-                brickwall: false,
-                setSmoothing: (seconds) => rampParam(comp.attack, seconds),
-                setRelease: (seconds) => rampParam(comp.release, seconds)
-            };
+    /**
+     * Connect each analyser only while something reads it: the input one for
+     * the meters and the silence watchdog, the output one for the meters.
+     * An analyser that nobody polls still copies every quantum on the audio
+     * thread.
+     */
+    function updateAnalyserTaps() {
+        if (!STATE.audioContext) return;
+        const wantInput = !!STATE.meterTimer || !!STATE.watchdogTimer;
+        const wantOutput = !!STATE.meterTimer;
+        if (wantInput !== STATE.inputTapped) {
+            if (wantInput) STATE.inputGain.connect(STATE.inputAnalyser);
+            else try { STATE.inputGain.disconnect(STATE.inputAnalyser); } catch (_) {}
+            STATE.inputTapped = wantInput;
+        }
+        if (wantOutput !== STATE.outputTapped) {
+            if (wantOutput) STATE.limiter.output.connect(STATE.outputAnalyser);
+            else try { STATE.limiter.output.disconnect(STATE.outputAnalyser); } catch (_) {}
+            STATE.outputTapped = wantOutput;
         }
     }
 
-    async function createLimiter(ctx) {
+    function createLimiter(ctx) {
         const input = ctx.createGain();
 
-        // Drive sits ahead of the limiter, so raising Loudness pushes signal
-        // into a fixed ceiling rather than adding gain after the only stage
-        // protecting the output. This is the LoudMax threshold control: lowering
-        // the threshold and making up the difference is the same operation.
-        const drive = ctx.createGain();
-        drive.gain.value = 1.0;
-
-        const limiter = await createBrickwallNode(ctx);
-
-        input.connect(drive);
-        drive.connect(limiter.node);
-
-        return {
-            input,
-            output: limiter.node,
-            drive,
-            brickwall: limiter.brickwall,
-            setSmoothing: limiter.setSmoothing,
-            setRelease: limiter.setRelease
-        };
-    }
-
-    function updateDSPChain() {
-        if (!STATE.audioContext || !STATE.masterGain || !STATE.limiter || !STATE.eq) return;
-
-        // Disconnect all potential intermediate nodes to reset the chain
-        try {
-            STATE.masterGain.disconnect();
-        } catch (_) {}
-        try {
-            if (STATE.hpFilter) STATE.hpFilter.disconnect();
-        } catch (_) {}
-        try {
-            STATE.eq.output.disconnect();
-        } catch (_) {}
-
-        let currentNode = STATE.masterGain;
-
-        // 1. Highpass Filter (Optional)
-        if (STATE.hpEnabled) {
-            if (!STATE.hpFilter) {
-                STATE.hpFilter = createBiquadHighpass(STATE.audioContext, 200);
-            }
-            currentNode.connect(STATE.hpFilter);
-            currentNode = STATE.hpFilter;
-        }
-
-        // 2. Equalizer (Optional)
-        if (STATE.eqEnabled) {
-            currentNode.connect(STATE.eq.input);
-            currentNode = STATE.eq.output;
-        }
-
-        // 3. Limiter (Always last before destination)
-        currentNode.connect(STATE.limiter.input);
-    }
-
-    function generateFIRFilter(sampleRate, filterType, cutoffFreq, filterLength = 127) {
-        // Generate FIR filter coefficients using windowed sinc method because math
-        // This creates linear phase filters that avoid phase distortion
-        // Reduced filter length to minimize latency and processing overhead
-        // Cycles per sample, which is what sin(2*pi*F*n)/(pi*n) expects. Using
-        // cutoff/nyquist here instead doubled every cutoff, and pushed the
-        // 20 kHz lowpass past 0.5 where the sinc stops being a lowpass at all
-        // and turns into a ~2x passthrough (the band's old +6 dB error).
-        const normalizedFreq = Math.min(cutoffFreq / sampleRate, 0.4999);
-        const halfLength = Math.floor(filterLength / 2);
-        const coefficients = new Float32Array(filterLength);
-
-        // Generate sinc function
-        for (let i = 0; i < filterLength; i++) {
-            const n = i - halfLength;
-            if (n === 0) {
-                coefficients[i] = 2 * normalizedFreq;
-            } else {
-                const sinc = Math.sin(2 * Math.PI * normalizedFreq * n) / (Math.PI * n);
-                // Apply Hamming window
-                const window = 0.54 - 0.46 * Math.cos(2 * Math.PI * i / (filterLength - 1));
-                coefficients[i] = sinc * window;
-            }
-        }
-
-        // For highpass, subtract lowpass from impulse
-        if (filterType === 'highpass') {
-            const impulse = new Float32Array(filterLength);
-            impulse[halfLength] = 1;
-            for (let i = 0; i < filterLength; i++) {
-                coefficients[i] = impulse[i] - coefficients[i];
-            }
-        }
-
-        // Normalize to unity passband gain by evaluating the filter's own
-        // response where its passband lives: DC for a lowpass, Nyquist for a
-        // highpass. Normalizing a highpass by peak coefficient magnitude
-        // instead (which is not passband gain) left the 2.5 kHz band running
-        // 8 dB hot.
-        let passbandGain = 0;
-        if (filterType === 'lowpass') {
-            // H(0) = sum(h[n])
-            for (let i = 0; i < filterLength; i++) passbandGain += coefficients[i];
-        } else {
-            // H(Nyquist) = sum(h[n] * (-1)^n)
-            for (let i = 0; i < filterLength; i++) {
-                passbandGain += (i % 2 === 0) ? coefficients[i] : -coefficients[i];
-            }
-        }
-
-        if (Math.abs(passbandGain) > 1e-12) {
-            const factor = 1.0 / passbandGain;
-            for (let i = 0; i < filterLength; i++) coefficients[i] *= factor;
-        }
-
-        return coefficients;
-    }
-
-    function createBiquadHighpass(ctx, cutoffHz) {
-        const filter = ctx.createBiquadFilter();
-        filter.type = 'highpass';
-        filter.frequency.value = cutoffHz;
-        filter.Q.value = 1.0; // Quality factor
-
-        return filter;
-    }
-
-    // CRITICAL: ConvolverNode.normalize defaults to true, which applies an
-    // equal-power scaling calibrated for multi-second reverb impulses. On a
-    // 127-tap FIR that works out to between -19 dB and -43 dB per filter, and
-    // there are two per band. It must be set to false, and it is only read at
-    // the moment .buffer is assigned, so the order below matters.
-    function createFIRConvolver(ctx, coefficients, sampleRate) {
-        const convolver = ctx.createConvolver();
-        convolver.normalize = false;
-
-        const buffer = ctx.createBuffer(1, coefficients.length, sampleRate);
-        buffer.copyToChannel(coefficients, 0);
-        convolver.buffer = buffer;
-
-        return convolver;
-    }
-
-    function createLinearPhaseBandpass(ctx, lowHz, highHz) {
-        const sampleRate = ctx.sampleRate;
-
-        // Lowpass sets the band's upper edge, highpass its lower edge.
-        const lowpassConvolver = createFIRConvolver(
-            ctx, generateFIRFilter(sampleRate, 'lowpass', highHz), sampleRate
-        );
-        const highpassConvolver = createFIRConvolver(
-            ctx, generateFIRFilter(sampleRate, 'highpass', lowHz), sampleRate
-        );
-
-        // Chain highpass into lowpass to create a band-pass
-        highpassConvolver.connect(lowpassConvolver);
-
-        return {
-            input: highpassConvolver,
-            output: lowpassConvolver,
-            first: highpassConvolver,
-            last: lowpassConvolver
-        };
-    }
-
-    function createBand(ctx, lowHz, highHz, trimDb) {
-        // Split band using linear phase filters
-        const filters = createLinearPhaseBandpass(ctx, lowHz, highHz);
-
-        const splitter = ctx.createGain();
-        const dynamics = effectiveDynamics();
-        const compAttack = msToSeconds(dynamics.compAttackMs);
-        const compRelease = msToSeconds(dynamics.compReleaseMs);
-        const profile = loudnessProfile(loudnessAmount(STATE.limiterThresholdDb));
-
-        // Downward path: holds the loud end of the band in check, then makeup
-        // returns full-scale content to where it started so the compression
-        // reads as density rather than as a volume drop.
-        const downComp = ctx.createDynamicsCompressor();
-        downComp.threshold.value = profile.downward.thresholdDb;
-        downComp.knee.value = profile.downward.kneeDb;
-        downComp.ratio.value = profile.downward.ratio;
-        downComp.attack.value = compAttack;
-        downComp.release.value = compRelease;
-
-        const downMakeup = ctx.createGain();
-        downMakeup.gain.value = dbToGain(unityMakeupDb(profile.downward));
-
-        // Upward path: a low threshold with a high ratio collapses the band's
-        // dynamic range from the bottom, and the makeup below restores the loud
-        // end exactly, so the net effect is that only quiet content is lifted.
-        // (DynamicsCompressorNode clamps ratio to 1-20, so a sub-1 ratio cannot
-        // be used to get upward behaviour directly.)
-        const upComp = ctx.createDynamicsCompressor();
-        upComp.threshold.value = profile.upward.thresholdDb;
-        upComp.knee.value = profile.upward.kneeDb;
-        upComp.ratio.value = profile.upward.ratio;
-        upComp.attack.value = clamp(compAttack * UPWARD_ATTACK_SCALE, 0, 1);
-        upComp.release.value = clamp(compRelease * UPWARD_RELEASE_SCALE, 0, 1);
-
-        const upMakeup = ctx.createGain();
-        upMakeup.gain.value = dbToGain(unityMakeupDb(profile.upward));
-
-        // Both paths share the FIR delay, so a fixed wet mix is phase-safe.
-        const downGain = ctx.createGain();
-        downGain.gain.value = BLEND.down;
-
-        const upGain = ctx.createGain();
-        upGain.gain.value = BLEND.up;
-
-        // Tonal trim only, correcting the splitter's own response.
-        const trim = ctx.createGain();
-        trim.gain.value = dbToGain(trimDb);
-
-        filters.last.connect(splitter);
-
-        splitter.connect(downComp);
-        downComp.connect(downMakeup);
-        downMakeup.connect(downGain);
-
-        splitter.connect(upComp);
-        upComp.connect(upMakeup);
-        upMakeup.connect(upGain);
-
-        downGain.connect(trim);
-        upGain.connect(trim);
-
-        return {
-            input: filters.first,
-            output: trim,
-            downComp,
-            upComp,
-            downMakeup,
-            upMakeup,
-            downGain,
-            upGain
-        };
-    }
-
-    function applyDynamics() {
-        const dynamics = effectiveDynamics();
-        const compAttack = msToSeconds(dynamics.compAttackMs);
-        const compRelease = msToSeconds(dynamics.compReleaseMs);
-        const upAttack = clamp(compAttack * UPWARD_ATTACK_SCALE, 0, 1);
-        const upRelease = clamp(compRelease * UPWARD_RELEASE_SCALE, 0, 1);
-        const preBoost = dbToGain(dynamics.preBoostDb);
-
-        STATE.mediaElToNodes.forEach((nodes) => {
-            rampParam(nodes.preGain.gain, preBoost);
-            [nodes.low, nodes.mid, nodes.high].forEach((band) => {
-                if (!band) return;
-                band.downComp.attack.value = compAttack;
-                band.downComp.release.value = compRelease;
-                band.upComp.attack.value = upAttack;
-                band.upComp.release.value = upRelease;
-            });
+        const node = new AudioWorkletNode(ctx, LIMITER_WORKLET_NAME, {
+            numberOfInputs: 1,
+            numberOfOutputs: 1
         });
 
-        if (STATE.limiter) {
-            STATE.limiter.setSmoothing(msToSeconds(dynamics.limiterAttackMs));
-            STATE.limiter.setRelease(msToSeconds(dynamics.limiterReleaseMs));
-        }
+        input.connect(node);
+
+        // Loudness no longer pushes into the limiter: the auto level and the
+        // band thresholds set the level, and the limiter only catches stray
+        // peaks. Its drive stays at unity.
+        node.port.onmessage = (event) => {
+            const data = event.data;
+            if (data && data.type === 'gr') STATE.limiterReductionDb = data.db;
+        };
+
+        return { input, output: node, node, parameters: node.parameters };
     }
 
-    // Morph compressor strength and limiter drive together. No dry/wet mix:
-    // that would comb against the FIR and look-ahead delays.
-    function applyLoudness(thresholdDb) {
-        const profile = loudnessProfile(loudnessAmount(thresholdDb));
+    // The optional stages sit between the dynamics worklet and the limiter.
+    function updateRouting() {
+        if (!STATE.audioContext || !STATE.dynamics || !STATE.limiter || !STATE.eq) return;
 
-        if (STATE.limiter && STATE.limiter.drive) {
-            rampParam(STATE.limiter.drive.gain, dbToGain(profile.driveDb));
+        [STATE.dynamics.node, STATE.hpFilter, STATE.eq.output].forEach((node) => {
+            try { node.disconnect(); } catch (_) {}
+        });
+
+        let current = STATE.dynamics.node;
+        if (STATE.settings.hpEnabled) {
+            current.connect(STATE.hpFilter);
+            current = STATE.hpFilter;
+        }
+        if (STATE.settings.eqEnabled) {
+            current.connect(STATE.eq.input);
+            current = STATE.eq.output;
+        }
+        current.connect(STATE.limiter.input);
+    }
+
+    /* ------------------------------------------------------------- autoplay */
+
+    const GESTURE_EVENTS = ['pointerdown', 'keydown', 'touchstart', 'touchend', 'play'];
+
+    function onGesture() {
+        resumeContext();
+    }
+
+    function installGestureListeners() {
+        GESTURE_EVENTS.forEach((type) => {
+            document.addEventListener(type, onGesture, { capture: true, passive: true });
+        });
+    }
+
+    function removeGestureListeners() {
+        GESTURE_EVENTS.forEach((type) => {
+            document.removeEventListener(type, onGesture, { capture: true });
+        });
+    }
+
+    // Autoplay policy starts the context suspended. Because
+    // createMediaElementSource reroutes the element's audio into that context, a
+    // suspended context is not "processing paused", it is total silence — and
+    // bypass runs through the same context, so switching off does not restore it.
+    function resumeContext() {
+        const ctx = STATE.audioContext;
+        if (!ctx || ctx.state !== 'suspended') return;
+        STATE.idleSuspended = false;
+        STATE.idleSince = 0;
+        ctx.resume().catch(() => {});
+    }
+
+    function delay(ms) {
+        return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    // The page's own answer, where Firefox has one (112+), to whether this
+    // context may start without a gesture.
+    function autoplayPolicy(ctx) {
+        try {
+            if (typeof navigator.getAutoplayPolicy === 'function') return navigator.getAutoplayPolicy(ctx);
+        } catch (_) {}
+        return '';
+    }
+
+    /**
+     * Whether the context is running, or can be started now. Asked before an
+     * element's audio is taken, because a context that cannot run outputs
+     * nothing and the element cannot be given back. Waits a moment for
+     * resume(), since a gesture that just happened usually lets it through.
+     */
+    async function contextCanRun(ctx) {
+        if (ctx.state === 'running') return true;
+        if (ctx.state === 'closed') return false;
+        if (autoplayPolicy(ctx) === 'disallowed') {
+            let activated = false;
+            try { activated = !!(navigator.userActivation && navigator.userActivation.isActive); } catch (_) {}
+            if (!activated) return false;
+        }
+        STATE.idleSuspended = false;
+        await Promise.race([ctx.resume().catch(() => {}), delay(CONTEXT_START_TIMEOUT_MS)]);
+        return ctx.state === 'running';
+    }
+
+    function retryDeferred() {
+        const pending = Array.from(STATE.deferred);
+        STATE.deferred.clear();
+        pending.forEach((mediaEl) => {
+            if (!mediaEl.paused && !mediaEl.ended) wireMediaElement(mediaEl);
+        });
+    }
+
+    // Whether a suspended context could be resumed again without a fresh
+    // gesture. Suspending one that could not would silence the next play.
+    function canResumeLater(ctx) {
+        try {
+            if (navigator.userActivation && navigator.userActivation.hasBeenActive) return true;
+        } catch (_) {}
+        return autoplayPolicy(ctx) === 'allowed';
+    }
+
+    function anyMediaPlaying() {
+        let playing = false;
+        STATE.mediaNodes.forEach((_, el) => {
+            if (!el.paused && !el.ended) playing = true;
+        });
+        return playing;
+    }
+
+    // Idle suspend: nothing tracked has played for IDLE_SUSPEND_MS. Cheap to
+    // poll; the check itself is a few property reads per element.
+    function startIdleWatch() {
+        if (STATE.idleTimer) return;
+        STATE.idleTimer = setInterval(() => {
+            const ctx = STATE.audioContext;
+            if (!ctx || ctx.state !== 'running' || STATE.meterTimer) {
+                STATE.idleSince = 0;
+                return;
+            }
+            if (anyMediaPlaying()) {
+                STATE.idleSince = 0;
+                return;
+            }
+            const now = Date.now();
+            if (!STATE.idleSince) {
+                STATE.idleSince = now;
+                return;
+            }
+            if (now - STATE.idleSince < IDLE_SUSPEND_MS || !canResumeLater(ctx)) return;
+            STATE.idleSuspended = true;
+            ctx.suspend().catch(() => { STATE.idleSuspended = false; });
+        }, IDLE_CHECK_INTERVAL_MS);
+    }
+
+    // Android suspends a page's audio in the background and may not bring it
+    // back by itself.
+    function onVisibilityChange() {
+        if (!document.hidden && anyMediaPlaying()) resumeContext();
+    }
+
+    /* ------------------------------------------------------- media elements */
+
+    /**
+     * Whether taking this element's audio would silence it.
+     *
+     * createMediaElementSource on cross-origin media served without CORS headers
+     * produces a node that outputs silence, per spec, and there is no way to give
+     * the element back afterwards. So this has to be decided before we touch it,
+     * not detected after.
+     */
+    function wireBlockReason(mediaEl) {
+        if (STATE.protectedElements.has(mediaEl) || mediaEl.mediaKeys != null) return 'drm';
+
+        const source = mediaEl.currentSrc || mediaEl.src || '';
+        if (!source) return 'no-source';
+
+        let url;
+        try {
+            url = new URL(source, document.baseURI);
+        } catch (_) {
+            return 'bad-source';
         }
 
-        STATE.mediaElToNodes.forEach((nodes) => {
-            [nodes.low, nodes.mid, nodes.high].forEach((band) => {
-                if (!band) return;
-                applyCompressorSettings(band.downComp, band.downMakeup, profile.downward);
-                applyCompressorSettings(band.upComp, band.upMakeup, profile.upward);
-            });
-        });
+        // MSE and in-page buffers are same-origin by construction. This is the
+        // path YouTube, Twitch and essentially every adaptive player takes.
+        if (url.protocol === 'blob:' || url.protocol === 'data:' || url.protocol === 'mediasource:') {
+            return null;
+        }
+
+        if (url.origin === window.location.origin) return null;
+        if (mediaEl.crossOrigin === 'anonymous' || mediaEl.crossOrigin === 'use-credentials') return null;
+
+        return 'cross-origin';
+    }
+
+    function trackElement(mediaEl) {
+        if (STATE.inert || !STATE.decided) return;
+        if (STATE.mediaNodes.has(mediaEl) || STATE.wiring.has(mediaEl)) {
+            reconnectElement(mediaEl);
+            return;
+        }
+
+        if (!STATE.watched.has(mediaEl)) {
+            STATE.watched.add(mediaEl);
+            // EME sites call setMediaKeys() well after document_idle, so the
+            // only reliable signal is the event. Registering at discovery time
+            // means it has fired before the first `playing`.
+            mediaEl.addEventListener('encrypted', () => {
+                STATE.protectedElements.add(mediaEl);
+            }, { capture: true });
+            mediaEl.addEventListener('playing', () => {
+                wireMediaElement(mediaEl);
+            }, { capture: true });
+            // Media events do not leave a shadow root, so the document-level
+            // listener cannot be relied on to see this one. `play` comes
+            // before any audio, which gives an idle-suspended context time
+            // to start again.
+            mediaEl.addEventListener('play', () => {
+                if (STATE.mediaNodes.has(mediaEl)) resumeContext();
+            }, { capture: true });
+        }
+
+        if (!mediaEl.paused && mediaEl.readyState >= 2) wireMediaElement(mediaEl);
     }
 
     async function wireMediaElement(mediaEl) {
-        if (STATE.mediaElToNodes.has(mediaEl) || STATE.pendingElements.has(mediaEl)) return;
+        // Last line of defence: an exempted page's media is never taken.
+        if (STATE.inert) return;
+        if (STATE.mediaNodes.has(mediaEl)) {
+            reconnectElement(mediaEl);
+            resumeContext();
+            return;
+        }
+        if (STATE.wiring.has(mediaEl) || STATE.contextFailed) return;
 
-        // Checked before building anything, so a page that only carries DRM
-        // content never gets an AudioContext at all.
-        if (mediaEl.mediaKeys != null || mediaEl.encrypted || mediaEl.hasAttribute('data-eme')) {
-            console.log('ThunderFox: DRM protected content detected, bypassing audio processing');
+        const reason = wireBlockReason(mediaEl);
+
+        // Cross-origin is only fatal when the server refuses CORS. Reddit's
+        // v.redd.it, for one, sends Access-Control-Allow-Origin: * on its
+        // direct MP4s, so the element can be reloaded in CORS mode and taken
+        // safely. One attempt per element.
+        if (reason === 'cross-origin' && !STATE.corsTried.has(mediaEl)) {
+            STATE.corsTried.add(mediaEl);
+            upgradeToCors(mediaEl).then((upgraded) => {
+                if (upgraded) wireMediaElement(mediaEl);
+                else skipElement(mediaEl, reason);
+            }).catch(() => skipElement(mediaEl, reason));
             return;
         }
 
-        // Loading the limiter worklet is asynchronous, so the same element can
-        // arrive again from the observer before the first call finishes.
-        STATE.pendingElements.add(mediaEl);
+        if (reason) {
+            skipElement(mediaEl, reason);
+            return;
+        }
+
+        STATE.wiring.add(mediaEl);
         try {
             await ensureAudioContext();
-        } catch (error) {
-            STATE.pendingElements.delete(mediaEl);
-            console.log('ThunderFox: Unable to start audio processing:', error);
+        } catch (_) {
+            STATE.wiring.delete(mediaEl);
             return;
         }
 
         try {
-            if (STATE.mediaElToNodes.has(mediaEl) || !mediaEl.isConnected) return;
+            if (STATE.mediaNodes.has(mediaEl)) return;
 
             const ctx = STATE.audioContext;
+            if (!(await contextCanRun(ctx))) {
+                // Leave it playing natively. The context starting (on the
+                // next gesture) or the element's next `playing` retries.
+                if (!STATE.deferred.has(mediaEl)) {
+                    STATE.deferred.add(mediaEl);
+                    console.info('ThunderFox: audio cannot start yet, leaving this media unprocessed until a tap or key press');
+                }
+                installGestureListeners();
+                return;
+            }
+            if (STATE.mediaNodes.has(mediaEl)) return;
+            STATE.deferred.delete(mediaEl);
 
             let source;
             try {
                 source = ctx.createMediaElementSource(mediaEl);
             } catch (error) {
-                console.log('ThunderFox: Unable to access media element audio:', error);
+                // Only reachable if something else already claimed the element.
+                STATE.skipped.add(mediaEl);
+                console.warn('ThunderFox: could not take this element\'s audio', error);
                 return;
             }
 
-            // Pre-boost sits ahead of the bands, so raising it drives the
-            // compressors harder and adds density as well as level.
-            const preGain = ctx.createGain();
-            preGain.gain.value = dbToGain(effectiveDynamics().preBoostDb);
-
-            const low = createBand(ctx, 20, 200, BAND_TRIM_DB.low);
-            const mid = createBand(ctx, 200, 2500, BAND_TRIM_DB.mid);
-            const high = createBand(ctx, 2500, 20000, BAND_TRIM_DB.high);
-
-            source.connect(preGain);
-            preGain.connect(low.input);
-            preGain.connect(mid.input);
-            preGain.connect(high.input);
-
-            low.output.connect(STATE.masterGain);
-            mid.output.connect(STATE.masterGain);
-            high.output.connect(STATE.masterGain);
-
-            STATE.mediaElToNodes.set(mediaEl, { source, preGain, low, mid, high });
-            applyEnabledState(mediaEl);
-
-            console.log('ThunderFox: Media element wired successfully', {
-                enabled: STATE.enabled,
-                brickwall: STATE.limiter ? STATE.limiter.brickwall : false
-            });
+            STATE.mediaNodes.set(mediaEl, { source });
+            reconnectElement(mediaEl);
+            resumeContext();
+            startWatchdog();
+            startIdleWatch();
         } finally {
-            STATE.pendingElements.delete(mediaEl);
+            STATE.wiring.delete(mediaEl);
         }
     }
 
-    function unwireMediaElement(mediaEl) {
-        const nodes = STATE.mediaElToNodes.get(mediaEl);
-        if (!nodes) return;
-        try {
-            nodes.source.disconnect();
-            nodes.low.output.disconnect();
-            nodes.mid.output.disconnect();
-            nodes.high.output.disconnect();
-        } catch (_) {}
-        STATE.mediaElToNodes.delete(mediaEl);
-    }
+    // Bypass routes the source straight to the destination. It still runs
+    // through the AudioContext — there is no way back to native playback once
+    // createMediaElementSource has run — so the context must be resumed either
+    // way for "off" to mean anything.
+    function reconnectElement(mediaEl) {
+        const nodes = STATE.mediaNodes.get(mediaEl);
+        if (!nodes || !STATE.audioContext) return;
 
-    function applyEnabledState(mediaEl) {
-        const nodes = STATE.mediaElToNodes.get(mediaEl);
-        if (!nodes) return;
-        // When enabled, route through our graph; when disabled, bypass to destination
-        try {
-            nodes.source.disconnect();
-        } catch (_) {}
+        // Rescans call this for every known element, so it has to be a no-op
+        // when nothing changed. Disconnecting and reconnecting a live source
+        // drops a sample and clicks.
+        const target = STATE.settings.enabled ? 'graph' : 'bypass';
+        if (nodes.target === target) return;
 
-        if (STATE.enabled) {
-            nodes.source.connect(nodes.preGain);
-            nodes.preGain.connect(nodes.low.input);
-            nodes.preGain.connect(nodes.mid.input);
-            nodes.preGain.connect(nodes.high.input);
+        try { nodes.source.disconnect(); } catch (_) {}
+
+        if (target === 'graph') {
+            nodes.source.connect(STATE.inputGain);
         } else {
-            // Bypass: connect straight to destination
             nodes.source.connect(STATE.audioContext.destination);
         }
+        nodes.target = target;
     }
 
-    function applyEnabledStateAll() {
-        STATE.mediaElToNodes.forEach((_, el) => applyEnabledState(el));
+    function reconnectAll() {
+        STATE.mediaNodes.forEach((_, mediaEl) => reconnectElement(mediaEl));
     }
+
+
+    function skipElement(mediaEl, reason) {
+        // 'no-source' is transient — the next `playing` retries — but the
+        // others are permanent for this element.
+        if (reason === 'no-source' || STATE.skipped.has(mediaEl)) return;
+        STATE.skipped.add(mediaEl);
+        console.info(`ThunderFox: leaving this media alone (${reason})`, mediaEl.currentSrc || '');
+    }
+
+    /* ------------------------------------------------------- CORS upgrade */
+
+    // Whether the page itself could fetch this URL with CORS. It has to be the
+    // page's own fetch: a content-script fetch carries the extension's host
+    // permissions and never fails a CORS check, so it would prove nothing.
+    function probeCors(url) {
+        let pageWindow;
+        try { pageWindow = window.wrappedJSObject; } catch (_) { return Promise.resolve(false); }
+        if (!pageWindow || typeof cloneInto !== 'function' || typeof pageWindow.fetch !== 'function') {
+            return Promise.resolve(false);
+        }
+        try {
+            const init = cloneInto(
+                { method: 'HEAD', mode: 'cors', credentials: 'omit', cache: 'no-store' },
+                pageWindow
+            );
+            return Promise.resolve(pageWindow.fetch(url, init)).then(() => true, () => false);
+        } catch (_) {
+            return Promise.resolve(false);
+        }
+    }
+
+    function waitForLoad(mediaEl) {
+        return new Promise((resolve) => {
+            let timer = null;
+            const done = (ok) => {
+                mediaEl.removeEventListener('loadedmetadata', onLoaded, true);
+                mediaEl.removeEventListener('error', onError, true);
+                clearTimeout(timer);
+                resolve(ok);
+            };
+            const onLoaded = () => done(true);
+            const onError = () => done(false);
+            timer = setTimeout(() => done(mediaEl.readyState >= 1), CORS_RELOAD_TIMEOUT_MS);
+            mediaEl.addEventListener('loadedmetadata', onLoaded, { capture: true });
+            // Capture also sees a <source> child's error.
+            mediaEl.addEventListener('error', onError, { capture: true });
+        });
+    }
+
+    // Seeking before metadata arrives sets the default playback start
+    // position, which the element honours once it can, so neither call has to
+    // wait for the reload to finish.
+    function resumePlayback(mediaEl, position, wasPlaying) {
+        if (position > 0) {
+            try { mediaEl.currentTime = position; } catch (_) {}
+        }
+        if (wasPlaying) {
+            try {
+                const promise = mediaEl.play();
+                if (promise && typeof promise.catch === 'function') promise.catch(() => {});
+            } catch (_) {}
+        }
+    }
+
+    /**
+     * Reload a cross-origin element in CORS mode so its audio can be taken
+     * without being zeroed.
+     *
+     * The crossorigin attribute is only read when a load starts, so changing
+     * it means calling load(), which restarts the resource from the top; the
+     * position and play state are put back straight after. If the CORS load
+     * fails the attribute is cleared and the element reloaded again, which
+     * leaves it exactly as the page had it, just not processed.
+     */
+    async function upgradeToCors(mediaEl) {
+        const source = mediaEl.currentSrc || mediaEl.src || '';
+        if (!source || !(await probeCors(source))) return false;
+
+        // The page may have moved on while the probe was in flight.
+        if ((mediaEl.currentSrc || mediaEl.src || '') !== source) return false;
+        if (STATE.mediaNodes.has(mediaEl) || STATE.wiring.has(mediaEl)) return false;
+
+        // Held for the whole reload so a rescan or `playing` cannot capture the
+        // element before the CORS load is known to have succeeded.
+        STATE.wiring.add(mediaEl);
+        try {
+            const wasPlaying = !mediaEl.paused && !mediaEl.ended;
+            const position = mediaEl.currentTime;
+
+            let loaded = waitForLoad(mediaEl);
+            mediaEl.crossOrigin = 'anonymous';
+            mediaEl.load();
+            resumePlayback(mediaEl, position, wasPlaying);
+
+            if (await loaded) {
+                console.info('ThunderFox: reloaded cross-origin media with CORS', source);
+                return true;
+            }
+
+            loaded = waitForLoad(mediaEl);
+            mediaEl.crossOrigin = null;
+            mediaEl.load();
+            resumePlayback(mediaEl, position, wasPlaying);
+            await loaded;
+            return false;
+        } finally {
+            STATE.wiring.delete(mediaEl);
+        }
+    }
+
+    /* ---------------------------------------------------------- discovery */
+
+    // Firefox lets content scripts see closed roots too.
+    function shadowRootOf(el) {
+        if (!el || el.nodeType !== 1) return null;
+        try {
+            return el.openOrClosedShadowRoot || el.shadowRoot || null;
+        } catch (_) {
+            return null;
+        }
+    }
+
+    // Reddit, and Lit-based players generally, create the <video> inside a
+    // shadow root that is attached when the component's bundle finishes
+    // loading, long after the host element was inserted and scanned. Attaching
+    // a shadow root produces no mutation record, so the observer alone never
+    // learns the root exists. Hooking attachShadow in the page's own world is
+    // the one signal that catches every root, closed ones included.
+    let restoreAttachShadow = null;
+
+    function hookAttachShadow() {
+        let pageWindow;
+        try { pageWindow = window.wrappedJSObject; } catch (_) { return; }
+        if (!pageWindow || typeof exportFunction !== 'function') return;
+
+        let proto;
+        let original;
+        try {
+            proto = pageWindow.Element.prototype;
+            original = proto.attachShadow;
+        } catch (_) {
+            return;
+        }
+        if (typeof original !== 'function') return;
+
+        const hooked = function(init) {
+            const root = Reflect.apply(original, this, [init]);
+            if (!STATE.inert) {
+                try {
+                    // Before the exemption check has finished, only remember
+                    // the root. Observing it now would let a page that turns
+                    // out to be exempted have its media found and taken
+                    // through that root anyway.
+                    if (STATE.decided) observeRoot(root);
+                    else STATE.earlyRoots.push(root);
+                } catch (_) {}
+            }
+            return root;
+        };
+
+        try {
+            proto.attachShadow = exportFunction(hooked, pageWindow);
+        } catch (_) {
+            return;
+        }
+        restoreAttachShadow = () => {
+            try { proto.attachShadow = original; } catch (_) {}
+        };
+    }
+
+    // Walking every element to find shadow roots is the only way to reach media
+    // inside a web component that existed before the attachShadow hook (server-
+    // rendered declarative shadow DOM, mainly), but it is far too expensive to
+    // run per mutation on a page like YouTube. The budget caps one pass. It
+    // used to give up on any subtree larger than the budget without looking at
+    // a single element, which on Reddit meant the whole initial feed.
+    const SHADOW_WALK_BUDGET = 3000;
+
+    function collectMedia(root, found, budget) {
+        if (!root || !root.querySelectorAll) return budget;
+
+        root.querySelectorAll('audio, video').forEach((el) => found.push(el));
+
+        if (budget <= 0) return 0;
+        const all = root.querySelectorAll('*');
+        const limit = Math.min(all.length, budget);
+        let remaining = budget - limit;
+
+        for (let i = 0; i < limit; i++) {
+            const shadow = shadowRootOf(all[i]);
+            if (!shadow) continue;
+            observeRoot(shadow);
+            // Past the budget this still observes the root and collects its
+            // direct media; only the deeper walk is skipped.
+            remaining = collectMedia(shadow, found, remaining);
+        }
+
+        return remaining;
+    }
+
+    function scan(root) {
+        const found = [];
+        if (root && (root.tagName === 'AUDIO' || root.tagName === 'VIDEO')) found.push(root);
+        const remaining = collectMedia(root, found, SHADOW_WALK_BUDGET);
+
+        // A host arrives as its own mutation record, before its children, so
+        // its shadow root is only reachable by asking the root itself.
+        const shadow = shadowRootOf(root);
+        if (shadow) {
+            observeRoot(shadow);
+            collectMedia(shadow, found, remaining);
+        }
+
+        found.forEach(trackElement);
+    }
+
+    // Additions are coalesced: a single burst of DOM churn should cost one pass,
+    // not one per record.
+    function flushPendingScans() {
+        STATE.scanTimer = null;
+        if (STATE.inert) {
+            STATE.pendingRoots.clear();
+            return;
+        }
+        const roots = Array.from(STATE.pendingRoots);
+        STATE.pendingRoots.clear();
+        roots.forEach((root) => {
+            if (root.isConnected === false && !shadowRootOf(root)) return;
+            scan(root);
+        });
+    }
+
+    // Removals are deliberately ignored. Players move their media around:
+    // YouTube re-parents its whole player container on every switch to or
+    // from theater mode or fullscreen, which arrives as a removal and an
+    // addition in the same task. Disconnecting on the removal and
+    // reconnecting at the next scan cut a fifth of a second out of the
+    // sound each time. A media element that really is removed needs nothing
+    // from us either: the HTML spec pauses it once it is out of the document
+    // at the next stable state, so it falls silent on its own, and it stays
+    // connected to the graph for whenever it comes back.
+    function handleMutations(records) {
+        if (STATE.inert) return;
+        for (const record of records) {
+            record.addedNodes.forEach((node) => {
+                if (!node || node.nodeType !== 1) return;
+                STATE.pendingRoots.add(node);
+            });
+        }
+
+        if (STATE.pendingRoots.size > 0 && !STATE.scanTimer) {
+            STATE.scanTimer = setTimeout(flushPendingScans, 200);
+        }
+    }
+
+    function observeRoot(root) {
+        if (!root || STATE.observedRoots.has(root)) return;
+        STATE.observedRoots.add(root);
+        STATE.observer.observe(root, { childList: true, subtree: true });
+    }
+
+    /* ---------------------------------------------------------- watchdog */
+
+    // If the page is playing but the summed input is digital silence, something
+    // upstream of us has been zeroed — almost always CORS tainting we failed to
+    // predict. There is no in-page recovery, so the honest move is to say so and
+    // point at the exemption, which does work (it reloads the tab).
+    function stopWatchdog() {
+        if (!STATE.watchdogTimer) return;
+        clearInterval(STATE.watchdogTimer);
+        STATE.watchdogTimer = null;
+        updateAnalyserTaps();
+    }
+
+    function startWatchdog() {
+        if (STATE.watchdogTimer || STATE.silenceReported) return;
+        const buffer = new Float32Array(STATE.inputAnalyser.fftSize);
+
+        STATE.watchdogTimer = setInterval(() => {
+            let playing = false;
+            STATE.mediaNodes.forEach((_, el) => {
+                if (!el.paused && !el.ended && !el.muted && el.volume > 0 && el.readyState >= 2) playing = true;
+            });
+
+            // A hidden page or a context that is not running reads as silence
+            // whatever the media's origin. On Android the popup hides the page,
+            // so judging then would blame CORS for the popup being open.
+            const ctx = STATE.audioContext;
+            if (!playing || document.hidden || !ctx || ctx.state !== 'running') {
+                STATE.silenceSince = 0;
+                return;
+            }
+
+            STATE.inputAnalyser.getFloatTimeDomainData(buffer);
+            let peak = 0;
+            for (let i = 0; i < buffer.length; i++) {
+                const magnitude = Math.abs(buffer[i]);
+                if (magnitude > peak) peak = magnitude;
+            }
+
+            if (peak > 1e-7) {
+                // Audio reaches the graph, so the path is not tainted. Nothing
+                // later can change that for these elements, and polling forever
+                // is not free. Withdraw the warning if it was raised too early.
+                if (STATE.silenceReported) clearBlockedFlag();
+                STATE.silenceSince = 0;
+                stopWatchdog();
+                STATE.silenceReported = true;
+                return;
+            }
+
+            if (STATE.silenceReported) return;
+
+            const now = Date.now();
+            if (!STATE.silenceSince) {
+                STATE.silenceSince = now;
+                return;
+            }
+
+            if (now - STATE.silenceSince < SILENCE_TIMEOUT_MS) return;
+
+            // Keep polling: if audio turns up later the warning was wrong and
+            // the branch above withdraws it.
+            STATE.silenceReported = true;
+
+            console.warn(
+                'ThunderFox: this page is playing but its audio reads as silent. '
+                + 'The media is most likely cross-origin without CORS headers. '
+                + 'Exempt this site in the popup and reload to restore it.'
+            );
+            browser.storage.local.set({ audioBlockedHost: window.location.hostname }).catch(() => {});
+        }, WATCHDOG_INTERVAL_MS);
+        updateAnalyserTaps();
+    }
+
+    function clearBlockedFlag() {
+        browser.storage.local.get({ audioBlockedHost: '' }).then((stored) => {
+            if (stored.audioBlockedHost !== window.location.hostname) return;
+            return browser.storage.local.set({ audioBlockedHost: '' });
+        }).catch(() => {});
+    }
+
+    /* ------------------------------------------------------------ settings */
+
+    // While Advanced is off the tunables revert to defaults, but the user's own
+    // values stay in storage and come back when it is switched on again.
+    function effectiveAdvanced(settings) {
+        if (settings.advancedEnabled) return settings;
+        const base = Object.assign({}, settings);
+        S.ADVANCED_ALL_KEYS.forEach((key) => { base[key] = S.DEFAULTS[key]; });
+        return base;
+    }
+
+    /**
+     * Apply settings to the graph, touching only what actually changed.
+     *
+     * The popup writes storage and messages the tab, and the content script
+     * listens to both, so every change arrives twice. Comparing against the last
+     * applied value makes the duplicate a no-op instead of a second
+     * cancelScheduledValues that cuts the first ramp short.
+     */
+    function applySettingsToGraph(settings, force) {
+        if (!STATE.audioContext) return;
+
+        const applied = STATE.applied;
+        const advanced = effectiveAdvanced(settings);
+        const loudness = S.loudnessProfile(settings.loudness);
+        const density = S.densityProfile(settings.density);
+
+        const targets = {
+            preGain: dbToGain(advanced.preBoostDb),
+            drive: 1,
+            agcEnabled: advanced.agcEnabled ? 1 : 0,
+            targetLufs: loudness.targetLufs,
+            agcMaxBoostDb: advanced.agcMaxBoostDb,
+            agcMaxCutDb: advanced.agcMaxCutDb,
+            agcSpeed: advanced.agcSpeed,
+            agcGateDb: advanced.agcGateDb,
+            crossLowHz: advanced.crossLowHz,
+            crossHighHz: advanced.crossHighHz,
+            density: density.q,
+            bandAttack: advanced.bandAttack,
+            bandRelease: advanced.bandRelease,
+            bandMaxGainDb: advanced.bandMaxGainDb,
+            nrEnabled: advanced.nrEnabled ? 1 : 0,
+            nrThresholdDb: advanced.nrThresholdDb,
+            nrFloorDb: advanced.nrFloorDb,
+            nrSpeed: advanced.nrSpeed,
+            ceiling: dbToGain(advanced.limiterCeilingDb),
+            smoothing: msToSeconds(advanced.limiterAttackMs),
+            limiterRelease: msToSeconds(advanced.limiterReleaseMs),
+            hold: msToSeconds(advanced.limiterHoldMs),
+            isp: advanced.limiterIsp ? 1 : 0
+        };
+        // Per band: the worklet names them low/mid/high, the settings
+        // bandLow/bandMid/bandHigh.
+        const bandParams = [];
+        S.BAND_KEYS.forEach((band) => {
+            const name = band.charAt(0).toLowerCase() + band.slice(1);
+            ['ThresholdDb', 'GainDb', 'NrOffsetDb'].forEach((suffix) => {
+                targets[name + suffix] = advanced[`band${band}${suffix}`];
+                bandParams.push(name + suffix);
+            });
+        });
+
+        const changed = (key) => force || applied[key] !== targets[key];
+
+        if (changed('preGain')) rampParam(STATE.preGain.gain, targets.preGain);
+
+        const dynamics = STATE.dynamics.parameters;
+        ['targetLufs', 'agcMaxBoostDb', 'agcMaxCutDb', 'agcSpeed', 'agcGateDb',
+            'crossLowHz', 'crossHighHz',
+            'density', 'bandAttack', 'bandRelease', 'bandMaxGainDb',
+            'nrThresholdDb', 'nrFloorDb', 'nrSpeed'].concat(bandParams).forEach((key) => {
+            if (changed(key)) rampParam(dynamics.get(key), targets[key]);
+        });
+        // Switches: stepped, never ramped through fractions. The auto level
+        // ramps itself back to unity when switched off.
+        if (changed('agcEnabled')) setParam(dynamics.get('agcEnabled'), targets.agcEnabled);
+        if (changed('nrEnabled')) setParam(dynamics.get('nrEnabled'), targets.nrEnabled);
+
+        const limiter = STATE.limiter.parameters;
+        if (changed('drive')) setParam(limiter.get('drive'), targets.drive);
+        if (changed('ceiling')) rampParam(limiter.get('ceiling'), targets.ceiling);
+        if (changed('limiterRelease')) rampParam(limiter.get('release'), targets.limiterRelease);
+        if (changed('hold')) rampParam(limiter.get('hold'), targets.hold);
+        // Structural: these become buffer lengths inside the worklet.
+        if (changed('smoothing')) setParam(limiter.get('smoothing'), targets.smoothing);
+        if (changed('isp')) setParam(limiter.get('isp'), targets.isp);
+
+        Object.assign(applied, targets);
+
+        const gains = settings.eqGains;
+        if (force || !applied.eqGains || gains.some((g, i) => applied.eqGains[i] !== g)) {
+            STATE.eq.setGains(gains);
+            applied.eqGains = gains.slice();
+        }
+    }
+
+    // Merge a patch of raw values into STATE.settings and push the result at the
+    // graph. Everything — messages, storage events, the initial read — funnels
+    // through here, so there is one sanitising path rather than three.
+    function updateSettings(patch) {
+        const next = Object.assign({}, STATE.settings);
+        let routingChanged = false;
+        let enabledChanged = false;
+
+        if (typeof patch.enabled === 'boolean' && patch.enabled !== next.enabled) {
+            next.enabled = patch.enabled;
+            enabledChanged = true;
+        }
+        if (typeof patch.hpEnabled === 'boolean' && patch.hpEnabled !== next.hpEnabled) {
+            next.hpEnabled = patch.hpEnabled;
+            routingChanged = true;
+        }
+        if (typeof patch.eqEnabled === 'boolean' && patch.eqEnabled !== next.eqEnabled) {
+            next.eqEnabled = patch.eqEnabled;
+            routingChanged = true;
+        }
+        if (patch.loudness !== undefined) next.loudness = S.sanitizeUnit(patch.loudness, next.loudness);
+        if (patch.density !== undefined) next.density = S.sanitizeUnit(patch.density, next.density);
+        if (patch.eqGains !== undefined) {
+            next.eqGains = S.sanitizeEqGains(patch.eqGains);
+        }
+        if (typeof patch.advancedEnabled === 'boolean') {
+            next.advancedEnabled = patch.advancedEnabled;
+        }
+
+        const advancedPatch = {};
+        let hasAdvanced = false;
+        S.ADVANCED_ALL_KEYS.forEach((key) => {
+            if (patch[key] !== undefined) {
+                advancedPatch[key] = patch[key];
+                hasAdvanced = true;
+            }
+        });
+        if (hasAdvanced) {
+            const merged = Object.assign({}, next, advancedPatch);
+            Object.assign(next, S.sanitizeAdvanced(merged));
+        }
+
+        STATE.settings = next;
+
+        if (enabledChanged) {
+            reconnectAll();
+            // Flush the look-ahead so the limiter does not replay stale audio
+            // from before the switch.
+            if (STATE.limiter) STATE.limiter.node.port.postMessage({ type: 'reset' });
+            if (STATE.dynamics) STATE.dynamics.node.port.postMessage({ type: 'reset' });
+        }
+        if (routingChanged) updateRouting();
+        applySettingsToGraph(next, false);
+    }
+
+    /* ------------------------------------------------------------- metering */
+
+    function analyserPeakDb(analyser, buffer) {
+        analyser.getFloatTimeDomainData(buffer);
+        let peak = 0;
+        for (let i = 0; i < buffer.length; i++) {
+            const magnitude = buffer[i] < 0 ? -buffer[i] : buffer[i];
+            if (magnitude > peak) peak = magnitude;
+        }
+        return peak > 0 ? 20 * Math.log10(peak) : METER_FLOOR_DB;
+    }
+
+    // Polling only runs while a popup is listening, so a page nobody is looking
+    // at pays nothing for the meters.
+    function startMeters() {
+        if (STATE.meterTimer || !STATE.inputAnalyser) return;
+
+        setWorkletMetering(true);
+        const buffer = new Float32Array(METER_FFT_SIZE);
+        STATE.meterTimer = setInterval(() => {
+            if (STATE.meterPorts.size === 0) {
+                stopMeters();
+                return;
+            }
+
+            const agc = STATE.agcReading;
+            const message = {
+                type: 'meters',
+                inputDb: analyserPeakDb(STATE.inputAnalyser, buffer),
+                outputDb: analyserPeakDb(STATE.outputAnalyser, buffer),
+                agcGainDb: agc ? agc.gainDb : 0,
+                agcGate: agc ? agc.gate : 0,
+                limiterReductionDb: STATE.limiterReductionDb
+            };
+
+            STATE.meterPorts.forEach((port) => {
+                try { port.postMessage(message); } catch (_) {}
+            });
+        }, METER_INTERVAL_MS);
+        updateAnalyserTaps();
+    }
+
+    function stopMeters() {
+        if (!STATE.meterTimer) return;
+        clearInterval(STATE.meterTimer);
+        STATE.meterTimer = null;
+        setWorkletMetering(false);
+        updateAnalyserTaps();
+    }
+
+    // The worklets only post readings while asked to, so a page nobody is
+    // looking at does no message traffic on the audio thread.
+    function setWorkletMetering(on) {
+        [STATE.dynamics, STATE.limiter].forEach((stage) => {
+            if (stage) stage.node.port.postMessage({ type: 'meters', on });
+        });
+        if (!on) {
+            STATE.agcReading = null;
+            STATE.limiterReductionDb = 0;
+        }
+    }
+
+    /* ---------------------------------------------------------------- init */
 
     // A subframe cannot read the top-level URL cross-origin and Firefox has no
     // location.ancestorOrigins, so the background page resolves it.
@@ -682,190 +1196,118 @@
     async function isPageExempted(exemptedSites) {
         if (ThunderFoxSites.isHostnameExempted(window.location.hostname, exemptedSites)) return true;
         if (window.top === window.self) return false;
-
-        // An exempted page must stay exempted for every frame it embeds.
         const topHostname = await getTopLevelHostname();
         return ThunderFoxSites.isHostnameExempted(topHostname, exemptedSites);
     }
 
-    async function init() {
-        const stored = await browser.storage.local.get({
-            enabled: true,
-            limiterThreshold: DEFAULT_LIMITER_THRESHOLD,
-            eqGains: [0, 0, 0, 0, 0, 0, 0, 0],
-            eqEnabled: true,
-            hpEnabled: false,
-            exemptedSites: null,
-            advancedEnabled: false,
-            preBoostDb: DEFAULT_DYNAMICS.preBoostDb,
-            compAttackMs: DEFAULT_DYNAMICS.compAttackMs,
-            compReleaseMs: DEFAULT_DYNAMICS.compReleaseMs,
-            limiterAttackMs: DEFAULT_DYNAMICS.limiterAttackMs,
-            limiterReleaseMs: DEFAULT_DYNAMICS.limiterReleaseMs
+    function handleMessage(message) {
+        if (!message || typeof message.type !== 'string') return;
+        if (message.type !== 'THUNDERFOX_SETTINGS') return;
+        if (STATE.inert) return;
+        updateSettings(message.settings || {});
+    }
+
+    function handleStorageChange(changes, area) {
+        if (area !== 'local' || STATE.inert) return;
+
+        const patch = {};
+        Object.keys(changes).forEach((key) => {
+            if (key === 'exemptedSites' || key === 'audioBlockedHost' || key === 'settingsVersion') return;
+            patch[key] = changes[key].newValue;
         });
+        if (Object.keys(patch).length === 0) return;
+
+        try {
+            updateSettings(patch);
+        } catch (error) {
+            console.error('ThunderFox: error handling storage change', error);
+        }
+    }
+
+    function handleConnect(port) {
+        if (!port || port.name !== 'thunderfox-meters' || STATE.inert) return;
+        STATE.meterPorts.add(port);
+        port.onDisconnect.addListener(() => {
+            STATE.meterPorts.delete(port);
+            if (STATE.meterPorts.size === 0) stopMeters();
+        });
+        startMeters();
+    }
+
+    async function init() {
+        // Registered before the first await. Previously both listeners landed
+        // after a storage read and a round trip to the background page, so a
+        // setting changed in that window was dropped for the tab with no error.
+        browser.runtime.onMessage.addListener(handleMessage);
+        browser.storage.onChanged.addListener(handleStorageChange);
+        browser.runtime.onConnect.addListener(handleConnect);
+
+        STATE.observer = new MutationObserver(handleMutations);
+        document.addEventListener('visibilitychange', onVisibilityChange);
+
+        // Also before the first await: page scripts start running as soon as we
+        // yield, and any shadow root they attach before the hook is in place
+        // is invisible to it.
+        hookAttachShadow();
+
+        const stored = await browser.storage.local.get(
+            Object.assign({ exemptedSites: null, audioBlockedHost: '' }, S.DEFAULTS)
+        );
 
         const exemptedSites = ThunderFoxSites.getStoredExemptedSites(
             stored.exemptedSites === null ? undefined : stored.exemptedSites
         );
 
-        // Bail out before creating an AudioContext, observing the DOM or
-        // registering any listener. Once createMediaElementSource() has been
-        // called on an element there is no way back, so an exempted page has to
-        // stay completely untouched; the popup reloads the tab when the
-        // exemption list changes.
+        // Bail out before creating an AudioContext or touching any element. Once
+        // createMediaElementSource() has run there is no way back, so an exempted
+        // page has to stay completely untouched; the popup reloads the tab when
+        // the exemption list changes.
         if (await isPageExempted(exemptedSites)) {
+            STATE.inert = true;
+            STATE.decided = true;
+            STATE.earlyRoots = [];
+            STATE.observer.disconnect();
+            if (restoreAttachShadow) restoreAttachShadow();
             console.info('ThunderFox: site is exempted, staying inert', {
                 hostname: window.location.hostname
             });
             return;
         }
+        STATE.decided = true;
 
-        STATE.enabled = !!stored.enabled;
-        STATE.eqEnabled = stored.eqEnabled !== undefined ? !!stored.eqEnabled : true;
-        STATE.hpEnabled = !!stored.hpEnabled;
-        STATE.limiterThresholdDb = typeof stored.limiterThreshold === 'number'
-            ? stored.limiterThreshold
-            : DEFAULT_LIMITER_THRESHOLD;
-        STATE.eqGains = Array.isArray(stored.eqGains) && stored.eqGains.length === 8
-            ? stored.eqGains.map(g => clamp(typeof g === 'number' ? g : 0, -18, 18))
-            : [0, 0, 0, 0, 0, 0, 0, 0];
-        STATE.advancedEnabled = !!stored.advancedEnabled;
-        STATE.dynamics = sanitizeDynamics(stored);
-
-        // Wire existing media elements
-        document.querySelectorAll('audio, video').forEach(wireMediaElement);
-
-        // Observe future media elements
-        STATE.observer = new MutationObserver(muts => {
-            for (const m of muts) {
-                m.addedNodes && m.addedNodes.forEach(node => {
-                    if (node && (node.tagName === 'AUDIO' || node.tagName === 'VIDEO')) {
-                        wireMediaElement(node);
-                    } else if (node && node.querySelectorAll) {
-                        node.querySelectorAll('audio, video').forEach(wireMediaElement);
-                    }
-                });
-                m.removedNodes && m.removedNodes.forEach(node => {
-                    if (node && (node.tagName === 'AUDIO' || node.tagName === 'VIDEO')) {
-                        unwireMediaElement(node);
-                    } else if (node && node.querySelectorAll) {
-                        node.querySelectorAll('audio, video').forEach(unwireMediaElement);
-                    }
-                });
-            }
-        });
-        STATE.observer.observe(document.documentElement || document.body, { childList: true, subtree: true });
-
-        // Listen for control messages
-        browser.runtime.onMessage.addListener((msg) => {
-            if (msg && msg.type === 'THUNDERFOX_TOGGLE') {
-                STATE.enabled = !!msg.enabled;
-                applyEnabledStateAll();
-                return;
-            }
-            if (msg && msg.type === 'THUNDERFOX_HP_TOGGLE') {
-                STATE.hpEnabled = !!msg.enabled;
-                updateDSPChain();
-                return;
-            }
-            if (msg && msg.type === 'THUNDERFOX_EQ_TOGGLE') {
-                STATE.eqEnabled = !!msg.enabled;
-                updateDSPChain();
-                return;
-            }
-            if (msg && msg.type === 'THUNDERFOX_LIMITER_THRESHOLD') {
-                const th = typeof msg.threshold === 'number' ? msg.threshold : DEFAULT_LIMITER_THRESHOLD;
-                STATE.limiterThresholdDb = th;
-                applyLoudness(th);
-                return;
-            }
-            if (msg && msg.type === 'THUNDERFOX_EQ_GAIN') {
-                if (typeof msg.bandIndex === 'number' && typeof msg.gainDb === 'number') {
-                    const bandIndex = clamp(Math.floor(msg.bandIndex), 0, 7);
-                    const gainDb = clamp(msg.gainDb, -18, 18);
-                    STATE.eqGains[bandIndex] = gainDb;
-                    if (STATE.eq && STATE.eq.setGain) {
-                        STATE.eq.setGain(bandIndex, gainDb);
-                    }
-                }
-                return;
-            }
-            if (msg && msg.type === 'THUNDERFOX_EQ_GAINS') {
-                if (Array.isArray(msg.gainsDb) && msg.gainsDb.length === 8) {
-                    STATE.eqGains = msg.gainsDb.map(g => clamp(typeof g === 'number' ? g : 0, -18, 18));
-                    if (STATE.eq && STATE.eq.setGains) {
-                        STATE.eq.setGains(STATE.eqGains);
-                    }
-                }
-                return;
-            }
-            if (msg && msg.type === 'THUNDERFOX_DYNAMICS') {
-                if (typeof msg.advancedEnabled === 'boolean') {
-                    STATE.advancedEnabled = msg.advancedEnabled;
-                }
-                STATE.dynamics = sanitizeDynamics(msg);
-                applyDynamics();
-                return;
-            }
+        STATE.settings = Object.assign({}, S.DEFAULTS, S.sanitizeAdvanced(stored), {
+            enabled: !!stored.enabled,
+            hpEnabled: !!stored.hpEnabled,
+            eqEnabled: stored.eqEnabled === undefined ? true : !!stored.eqEnabled,
+            advancedEnabled: !!stored.advancedEnabled,
+            loudness: S.sanitizeUnit(stored.loudness, S.DEFAULTS.loudness),
+            density: S.sanitizeUnit(stored.density, S.DEFAULTS.density),
+            eqGains: S.sanitizeEqGains(stored.eqGains)
         });
 
-        // Listen for storage changes so toggles take effect even if
-        // Popup messaging to the active tab fails (e.g. different window/tab)
-        browser.storage.onChanged.addListener((changes, area) => {
-            if (area !== 'local') return;
-            try {
-                if (changes.enabled) {
-                    STATE.enabled = !!changes.enabled.newValue;
-                    applyEnabledStateAll();
-                }
-                if (changes.hpEnabled) {
-                    STATE.hpEnabled = !!changes.hpEnabled.newValue;
-                    updateDSPChain();
-                }
-                if (changes.eqEnabled) {
-                    STATE.eqEnabled = !!changes.eqEnabled.newValue;
-                    updateDSPChain();
-                }
-                if (changes.limiterThreshold) {
-                    const th = typeof changes.limiterThreshold.newValue === 'number'
-                        ? changes.limiterThreshold.newValue
-                        : DEFAULT_LIMITER_THRESHOLD;
-                    STATE.limiterThresholdDb = th;
-                    applyLoudness(th);
-                }
-                if (changes.eqGains) {
-                    const gains = changes.eqGains.newValue;
-                    if (Array.isArray(gains) && gains.length === 8) {
-                        STATE.eqGains = gains.map(g => clamp(typeof g === 'number' ? g : 0, -18, 18));
-                        if (STATE.eq && STATE.eq.setGains) {
-                            STATE.eq.setGains(STATE.eqGains);
-                        }
-                    }
-                }
+        // Clear any stale "audio blocked" flag for this host. If the page is
+        // still broken the watchdog re-raises it within a couple of seconds, so
+        // the notice reflects this load rather than a previous one.
+        if (stored.audioBlockedHost === window.location.hostname) clearBlockedFlag();
 
-                const dynamicsKeys = Object.keys(DEFAULT_DYNAMICS);
-                const dynamicsChanged = dynamicsKeys.some(key => changes[key]);
-                if (changes.advancedEnabled || dynamicsChanged) {
-                    if (changes.advancedEnabled) {
-                        STATE.advancedEnabled = !!changes.advancedEnabled.newValue;
-                    }
-                    const next = Object.assign({}, STATE.dynamics);
-                    dynamicsKeys.forEach((key) => {
-                        if (changes[key]) next[key] = changes[key].newValue;
-                    });
-                    STATE.dynamics = sanitizeDynamics(next);
-                    applyDynamics();
-                }
-            } catch (e) {
-                console.error('ThunderFox: error handling storage.onChanged', e, changes);
-            }
+        // document is observed rather than documentElement, which document.write
+        // can replace and orphan.
+        observeRoot(document);
+        scan(document);
+
+        // Shadow roots attached while the exemption check was running. Their
+        // hosts may not be in the document yet, so the scan above cannot be
+        // relied on to reach them.
+        const early = STATE.earlyRoots;
+        STATE.earlyRoots = [];
+        early.forEach((root) => {
+            observeRoot(root);
+            scan(root);
         });
-
-        // Loudness, dynamics, EQ gains and routing are all applied by
-        // buildAudioContext(), which does not run until the first media
-        // element is wired.
     }
 
     // Fire up the bass cannon
-    init().catch(() => {});
+    init().catch((error) => {
+        console.error('ThunderFox: failed to start', error);
+    });
 })();

@@ -1,60 +1,168 @@
+const S = ThunderFoxSettings;
+
 const toggle = document.getElementById('toggle');
 const statusEl = document.getElementById('status');
 const hpToggle = document.getElementById('hpToggle');
-const limiterThreshold = document.getElementById('limiterThreshold');
+const loudnessSlider = document.getElementById('loudness');
 const loudnessValue = document.getElementById('loudness-value');
-const eqSliders = Array.from({ length: 8 }, (_, i) => document.getElementById(`eq${i}`));
-const eqValues = Array.from({ length: 8 }, (_, i) => document.getElementById(`eq${i}-value`));
+const densitySlider = document.getElementById('density');
+const densityValue = document.getElementById('density-value');
+const agcReading = document.getElementById('agcReading');
+const grReading = document.getElementById('grReading');
+const eqBands = document.getElementById('eqBands');
 const eqResetBtn = document.getElementById('eqReset');
 const eqSection = document.querySelector('.eq-section');
-const eqBands = document.querySelector('.eq-bands');
-const manageExemptionsBtn = document.getElementById('manageExemptions');
-
+const eqToggle = document.getElementById('eqToggle');
 const advancedSection = document.getElementById('advancedSection');
+const advancedBody = document.getElementById('advancedBody');
 const advancedToggle = document.getElementById('advancedToggle');
 const advancedResetBtn = document.getElementById('advancedReset');
+const blockedNotice = document.getElementById('blockedNotice');
+const manageExemptionsBtn = document.getElementById('manageExemptions');
 
 const exemptSection = document.querySelector('.exempt-section');
 const exemptToggle = document.getElementById('exemptToggle');
 const exemptLabel = document.getElementById('exemptLabel');
 const exemptHint = document.getElementById('exemptHint');
 
-// Ranges mirror DYNAMICS_LIMITS/DEFAULT_DYNAMICS in content/content.js.
-// unit 'db' uses a linear slider; 'ms' uses a logarithmic one.
-const DYNAMICS = {
-    preBoostDb: { min: 0, max: 24, default: 6, unit: 'db' },
-    compAttackMs: { min: 0.1, max: 100, default: 10, unit: 'ms' },
-    compReleaseMs: { min: 20, max: 1000, default: 300, unit: 'ms' },
-    limiterAttackMs: { min: 0.2, max: 5, default: 3, unit: 'ms' },
-    limiterReleaseMs: { min: 10, max: 500, default: 100, unit: 'ms' }
-};
+// Firefox for Android shows the popup as a full page, not a dropdown.
+browser.runtime.getPlatformInfo().then((info) => {
+    if (info.os === 'android') document.documentElement.classList.add('android');
+}).catch(() => {});
 
-// Matches MAX_DRIVE_DB in content/content.js.
-const MAX_LOUDNESS_DB = 30;
+// Which advanced controls appear, in which order, under which heading. Ranges
+// and defaults come from ThunderFoxSettings so there is one definition of each.
+const ADVANCED_LAYOUT = [
+    {
+        group: 'Input', rows: [
+            { key: 'preBoostDb', label: 'In gain' }
+        ]
+    },
+    {
+        group: 'Auto level', rows: [
+            { key: 'agcEnabled', label: 'On', type: 'checkbox' },
+            { key: 'agcMaxBoostDb', label: 'Max boost' },
+            { key: 'agcMaxCutDb', label: 'Max cut' },
+            { key: 'agcSpeed', label: 'Speed' },
+            { key: 'agcGateDb', label: 'Pause gate' }
+        ]
+    },
+    {
+        group: 'Crossover', rows: [
+            { type: 'multiRange', keys: ['crossLowHz', 'crossHighHz'], label: 'Points' }
+        ]
+    },
+    {
+        group: 'Bands', rows: [
+            { key: 'bandAttack', label: 'Attack' },
+            { key: 'bandRelease', label: 'Release' },
+            { key: 'bandMaxGainDb', label: 'Max gain' }
+        ]
+    },
+    {
+        group: 'Noise reduction', rows: [
+            { key: 'nrEnabled', label: 'On', type: 'checkbox' },
+            { key: 'nrThresholdDb', label: 'Threshold' },
+            { key: 'nrFloorDb', label: 'Depth' },
+            { key: 'nrSpeed', label: 'Speed' }
+        ]
+    },
+    ...[['Low', 'Low band'], ['Mid', 'Mid band'], ['High', 'High band']]
+        .map(([band, group]) => ({
+            group, rows: [
+                { key: `band${band}ThresholdDb`, label: 'Threshold' },
+                { key: `band${band}GainDb`, label: 'Gain' },
+                { key: `band${band}NrOffsetDb`, label: 'NR offset' }
+            ]
+        })),
+    {
+        group: 'Limiter', rows: [
+            { key: 'limiterAttackMs', label: 'Attack' },
+            { key: 'limiterReleaseMs', label: 'Release' },
+            { key: 'limiterHoldMs', label: 'Hold' },
+            { key: 'limiterCeilingDb', label: 'Ceiling' },
+            { key: 'limiterIsp', label: 'True peak', type: 'checkbox' }
+        ]
+    },
+    {
+        group: 'Audio buffer', rows: [
+            {
+                key: 'audioLatency', label: 'Buffer', type: 'select',
+                options: [
+                    ['auto', 'Auto'],
+                    ['low', 'Low latency'],
+                    ['balanced', 'Balanced'],
+                    ['stable', 'Stable']
+                ],
+                hint: 'Bigger buffers ride out a busy device without dropouts, '
+                    + 'but the sound lags the picture a little more. Auto is '
+                    + 'Balanced on Android, Low latency elsewhere. Applies '
+                    + 'after the page reloads.'
+            }
+        ]
+    }
+];
 
-const DYNAMICS_CONTROLS = {
-    preBoostDb: 'preBoost',
-    compAttackMs: 'compAttack',
-    compReleaseMs: 'compRelease',
-    limiterAttackMs: 'limiterAttack',
-    limiterReleaseMs: 'limiterRelease'
-};
+// Level meters run from this floor to 0 dBFS.
+const METER_FLOOR_DB = -60;
+
+// Peak fallback, in dB per update. Without it the bars flicker at whatever rate
+// the content script polls; with it they read like a meter.
+const METER_DECAY_DB = 1.8;
+
+const STORAGE_DEBOUNCE_MS = 120;
+
+// The popup's own copy of the settings. Reading storage back inside every input
+// handler is what let two fast slider events interleave as get, get, set, set
+// and lose one of the writes.
+let settings = Object.assign({}, S.DEFAULTS);
 
 let currentTab = null;
 let currentHostname = '';
 let exemptedSites = [];
+let meterPort = null;
 
-const canvas = document.createElement('canvas');
-canvas.className = 'eq-curve-canvas';
-if (eqBands) {
-    eqBands.appendChild(canvas);
+const eqSliders = [];
+const eqValues = [];
+const advancedControls = {};
+
+let pendingWrites = {};
+let writeTimer = null;
+
+/* ------------------------------------------------------------- persistence */
+
+// Messaging is immediate so the audio responds while the slider moves; the
+// storage write is debounced because each one broadcasts storage.onChanged to
+// every frame of every tab.
+function commit(patch) {
+    Object.assign(settings, patch);
+    Object.assign(pendingWrites, patch);
+
+    sendToActiveTab({ type: 'THUNDERFOX_SETTINGS', settings: patch });
+
+    if (writeTimer) clearTimeout(writeTimer);
+    writeTimer = setTimeout(() => {
+        writeTimer = null;
+        const values = pendingWrites;
+        pendingWrites = {};
+        browser.storage.local.set(values).catch((error) => {
+            console.error('ThunderFox: failed to save settings', error);
+        });
+    }, STORAGE_DEBOUNCE_MS);
 }
 
-const eqLabels = document.querySelectorAll('.eq-label');
-const freqLabels = ['68', '150', '315', '680', '1.5k', '3k', '7k', '15k'];
-eqLabels.forEach((el, i) => {
-    if (freqLabels[i]) el.textContent = freqLabels[i];
-});
+function flushWrites() {
+    if (!writeTimer) return;
+    clearTimeout(writeTimer);
+    writeTimer = null;
+    const values = pendingWrites;
+    pendingWrites = {};
+    browser.storage.local.set(values).catch(() => {});
+}
+
+// The popup can be dismissed mid-drag, before the debounce fires.
+window.addEventListener('pagehide', flushWrites);
+window.addEventListener('blur', flushWrites);
 
 async function sendToActiveTab(message) {
     if (!currentTab) return;
@@ -66,124 +174,409 @@ async function sendToActiveTab(message) {
     }
 }
 
-function setStatus(enabled) {
-    statusEl.textContent = enabled ? 'Enabled' : 'Disabled';
+/* ----------------------------------------------------------- slider mapping */
+
+// Attack and crossover ranges span three orders of magnitude, so a linear
+// slider would bunch everything useful into the first few pixels. Decibels and
+// percentages are already perceptually even, so those map linearly.
+function isLogUnit(range) {
+    return (range.unit === 'ms' || range.unit === 'hz') && range.min > 0;
 }
 
-function setEQVisibility(visible) {
-    if (eqSection) {
-        eqSection.classList.toggle('disabled', !visible);
-        if (visible) requestAnimationFrame(drawEQCurve);
-    }
-}
-
-// EQ Toggle
-const eqHeader = document.querySelector('.eq-header');
-
-const eqSwitchLabel = document.createElement('label');
-eqSwitchLabel.className = 'switch switch-sm';
-
-const eqCheckbox = document.createElement('input');
-eqCheckbox.type = 'checkbox';
-eqCheckbox.id = 'eqToggle';
-
-const eqSliderSpan = document.createElement('span');
-eqSliderSpan.className = 'slider';
-
-eqSwitchLabel.appendChild(eqCheckbox);
-eqSwitchLabel.appendChild(eqSliderSpan);
-
-// Append to header so it sits on the right (Title -> Reset -> Toggle)
-eqHeader.appendChild(eqSwitchLabel);
-
-const eqToggle = document.getElementById('eqToggle');
-
-/* Advanced attack/release controls */
-
-// Attack ranges span three orders of magnitude, so a linear slider would bunch
-// everything useful into the first few pixels. Decibels are already
-// logarithmic, so those map linearly.
 function sliderToValue(position, range) {
     const t = Number(position) / 100;
-    if (range.unit === 'db') return range.min + t * (range.max - range.min);
-    return range.min * Math.pow(range.max / range.min, t);
+    if (isLogUnit(range)) {
+        return range.min * Math.pow(range.max / range.min, t);
+    }
+    return range.min + t * (range.max - range.min);
 }
 
 function valueToSlider(value, range) {
-    const clamped = Math.max(range.min, Math.min(range.max, value));
-    if (range.unit === 'db') {
-        return Math.round(100 * (clamped - range.min) / (range.max - range.min));
+    const clamped = S.clamp(value, range.min, range.max);
+    if (isLogUnit(range)) {
+        return Math.round(100 * Math.log(clamped / range.min) / Math.log(range.max / range.min));
     }
-    return Math.round(100 * Math.log(clamped / range.min) / Math.log(range.max / range.min));
+    return Math.round(100 * (clamped - range.min) / (range.max - range.min));
 }
 
 function formatValue(value, range) {
-    if (range.unit === 'db') return `+${value.toFixed(1)} dB`;
+    if (range.unit === 'percent') return `${Math.round(value * 100)}%`;
+    if (range.unit === 'db' || range.unit === 'lu') {
+        const sign = value > 0 ? '+' : '';
+        return `${sign}${value.toFixed(1)} ${range.unit === 'db' ? 'dB' : 'LU'}`;
+    }
+    if (range.unit === 'hz') {
+        if (value >= 1000) {
+            const kilo = value / 1000;
+            return `${kilo >= 10 ? kilo.toFixed(1) : kilo.toFixed(2)} kHz`;
+        }
+        return `${Math.round(value)} Hz`;
+    }
     if (value < 1) return `${value.toFixed(2)} ms`;
     if (value < 10) return `${value.toFixed(1)} ms`;
     return `${Math.round(value)} ms`;
 }
 
-function readDynamicsFromUI() {
-    const values = {};
-    Object.keys(DYNAMICS).forEach((key) => {
-        const slider = document.getElementById(DYNAMICS_CONTROLS[key]);
-        values[key] = sliderToValue(slider.value, DYNAMICS[key]);
-    });
-    return values;
+/* --------------------------------------------------------------- rendering */
+
+function setStatus(enabled) {
+    statusEl.textContent = enabled ? 'Enabled' : 'Disabled';
 }
 
-function renderDynamics(values) {
-    Object.keys(DYNAMICS).forEach((key) => {
-        const range = DYNAMICS[key];
-        const slider = document.getElementById(DYNAMICS_CONTROLS[key]);
-        const readout = document.getElementById(`${DYNAMICS_CONTROLS[key]}-value`);
-        slider.value = String(valueToSlider(values[key], range));
-        readout.textContent = formatValue(values[key], range);
+// Loudness reads out as the target it sets; Density as its ratio.
+function renderLoudnessValue(amount) {
+    loudnessValue.textContent = `${S.loudnessProfile(amount).targetLufs.toFixed(1)} LUFS`;
+    loudnessSlider.setAttribute('aria-valuetext', loudnessValue.textContent);
+}
+
+function renderDensityValue(amount) {
+    const q = S.densityProfile(amount).q;
+    densityValue.textContent = q >= 0.995 ? '∞:1' : `${(1 / (1 - q)).toFixed(1)}:1`;
+    densitySlider.setAttribute('aria-valuetext', `ratio ${densityValue.textContent}`);
+}
+
+function renderMacros() {
+    loudnessSlider.value = String(Math.round(settings.loudness * 100));
+    renderLoudnessValue(settings.loudness);
+    densitySlider.value = String(Math.round(settings.density * 100));
+    renderDensityValue(settings.density);
+}
+
+function buildEq() {
+    S.EQ_BANDS.forEach((band, index) => {
+        const wrapper = document.createElement('div');
+        wrapper.className = 'eq-band';
+
+        const value = document.createElement('span');
+        value.className = 'eq-value';
+        value.id = `eq${index}-value`;
+
+        const container = document.createElement('div');
+        container.className = 'eq-slider-container';
+
+        const slider = document.createElement('input');
+        slider.type = 'range';
+        slider.className = 'eq-slider';
+        slider.id = `eq${index}`;
+        slider.min = String(-S.EQ_GAIN_LIMIT);
+        slider.max = String(S.EQ_GAIN_LIMIT);
+        slider.step = '0.5';
+        slider.value = '0';
+        slider.setAttribute('aria-label', `${band.label} equalizer band`);
+        slider.setAttribute('aria-orientation', 'vertical');
+
+        const label = document.createElement('span');
+        label.className = 'eq-label';
+        label.textContent = shortEqLabel(band.frequency);
+        label.title = band.label;
+
+        container.appendChild(slider);
+        wrapper.append(value, container, label);
+        eqBands.appendChild(wrapper);
+
+        eqSliders.push(slider);
+        eqValues.push(value);
+
+        slider.addEventListener('input', () => {
+            const gains = settings.eqGains.slice();
+            gains[index] = Number(slider.value);
+            renderEqValue(index, gains[index]);
+            commit({ eqGains: gains });
+            requestAnimationFrame(drawEQCurve);
+        });
+    });
+
+    eqBands.appendChild(canvas);
+}
+
+// Each band's column is about 26px wide, so the readout drops what it can:
+// "0", "+13", "+3.5", "-15". "+13.0" ran into its neighbours.
+function formatEqGain(gainDb) {
+    if (gainDb === 0) return '0';
+    const text = Number.isInteger(gainDb) ? String(Math.abs(gainDb)) : Math.abs(gainDb).toFixed(1);
+    return `${gainDb > 0 ? '+' : '-'}${text}`;
+}
+
+// The same for the frequency under each slider: "147", "1.5k", "15k". The
+// full label stays in the slider's accessible name.
+function shortEqLabel(frequency) {
+    if (frequency < 1000) return String(frequency);
+    const kilo = frequency / 1000;
+    return `${kilo >= 10 ? Math.round(kilo) : kilo.toFixed(1)}k`;
+}
+
+function renderEqValue(index, gainDb) {
+    eqValues[index].textContent = formatEqGain(gainDb);
+    eqSliders[index].setAttribute('aria-valuetext', `${gainDb.toFixed(1)} decibels`);
+}
+
+function renderEq() {
+    settings.eqGains.forEach((gain, index) => {
+        if (!eqSliders[index]) return;
+        eqSliders[index].value = String(gain);
+        renderEqValue(index, gain);
+    });
+    requestAnimationFrame(drawEQCurve);
+}
+
+/**
+ * Several thumbs on one rail: native range inputs stacked on top of each
+ * other, their tracks transparent and only their thumbs taking pointer
+ * events, over a drawn rail with a fill from the first thumb to the last.
+ * Native inputs keep keyboard support (arrows, Home/End) and the focus ring
+ * for free. Thumbs cannot cross: each clamps at one slider step (about 0.1
+ * octave on this log scale) short of its neighbours, which keeps every band
+ * nonzero and the thumbs separable by mouse.
+ */
+function buildMultiRange(row) {
+    // Every key shares the same 20 Hz - 18 kHz log range.
+    const range = S.LIMITS[row.keys[0]];
+    const count = row.keys.length;
+
+    const wrapper = document.createElement('div');
+    wrapper.className = 'row adv-row';
+
+    const label = document.createElement('label');
+    label.textContent = row.label;
+    label.htmlFor = `adv-${row.keys[0]}`;
+
+    const rail = document.createElement('div');
+    rail.className = 'dual-range';
+
+    const track = document.createElement('div');
+    track.className = 'dual-range-rail';
+    const fill = document.createElement('div');
+    fill.className = 'dual-range-fill';
+    track.appendChild(fill);
+
+    const names = ['Low/mid', 'Mid/high'];
+    const inputs = row.keys.map((key, index) => {
+        const input = document.createElement('input');
+        input.type = 'range';
+        input.id = `adv-${key}`;
+        input.min = '0';
+        input.max = '100';
+        input.step = '1';
+        input.setAttribute('aria-label', `${names[index] || `Crossover ${index + 1}`} crossover frequency`);
+        return input;
+    });
+
+    rail.append(track, ...inputs);
+    wrapper.append(label, rail);
+    advancedBody.appendChild(wrapper);
+
+    // Several values do not fit the 50px readout column, so they read out on
+    // their own line under the rail.
+    const readout = document.createElement('div');
+    readout.className = 'dual-range-readout';
+    readout.id = `adv-${row.keys[0]}-value`;
+    advancedBody.appendChild(readout);
+
+    const multi = {
+        render() {
+            const texts = row.keys.map((key, index) => {
+                inputs[index].value = String(valueToSlider(settings[key], range));
+                const text = formatValue(settings[key], range);
+                inputs[index].setAttribute('aria-valuetext', text);
+                return text;
+            });
+            readout.textContent = texts.join(' · ');
+            fill.style.left = `${Number(inputs[0].value)}%`;
+            fill.style.right = `${100 - Number(inputs[count - 1].value)}%`;
+        }
+    };
+
+    inputs.forEach((input, index) => {
+        input.addEventListener('input', () => {
+            let position = Number(input.value);
+            if (index > 0) position = Math.max(position, Number(inputs[index - 1].value) + 1);
+            if (index < count - 1) position = Math.min(position, Number(inputs[index + 1].value) - 1);
+            input.value = String(position);
+            commit({ [row.keys[index]]: sliderToValue(position, range) });
+            multi.render();
+        });
+    });
+
+    row.keys.forEach((key) => { advancedControls[key] = { multi }; });
+}
+
+function buildAdvanced() {
+    ADVANCED_LAYOUT.forEach((section) => {
+        const heading = document.createElement('div');
+        heading.className = 'adv-group';
+        heading.textContent = section.group;
+        advancedBody.appendChild(heading);
+
+        section.rows.forEach((row) => {
+            if (row.type === 'multiRange') {
+                buildMultiRange(row);
+                return;
+            }
+            if (row.type === 'select') {
+                const selectRow = document.createElement('div');
+                selectRow.className = 'row adv-row';
+                const selectLabel = document.createElement('label');
+                selectLabel.textContent = row.label;
+                selectLabel.htmlFor = `adv-${row.key}`;
+                const select = document.createElement('select');
+                select.id = `adv-${row.key}`;
+                select.className = 'adv-select';
+                row.options.forEach(([value, text]) => {
+                    const option = document.createElement('option');
+                    option.value = value;
+                    option.textContent = text;
+                    select.appendChild(option);
+                });
+                selectRow.append(selectLabel, select);
+                advancedBody.appendChild(selectRow);
+
+                if (row.hint) {
+                    const hint = document.createElement('p');
+                    hint.className = 'hint-text';
+                    hint.id = `adv-${row.key}-hint`;
+                    hint.textContent = row.hint;
+                    select.setAttribute('aria-describedby', hint.id);
+                    advancedBody.appendChild(hint);
+                }
+
+                advancedControls[row.key] = { select };
+                select.addEventListener('change', () => {
+                    commit({ [row.key]: select.value });
+                });
+                return;
+            }
+            if (row.type === 'checkbox') {
+                const checkboxRow = document.createElement('div');
+                checkboxRow.className = 'row adv-row';
+                const checkboxLabel = document.createElement('label');
+                checkboxLabel.textContent = row.label;
+                checkboxLabel.htmlFor = `adv-${row.key}`;
+                const checkbox = document.createElement('input');
+                checkbox.type = 'checkbox';
+                checkbox.id = `adv-${row.key}`;
+                checkboxRow.append(checkboxLabel, checkbox);
+                advancedBody.appendChild(checkboxRow);
+
+                advancedControls[row.key] = { input: checkbox };
+                checkbox.addEventListener('change', () => {
+                    commit({ [row.key]: checkbox.checked });
+                });
+                return;
+            }
+
+            const range = S.LIMITS[row.key];
+
+            const wrapper = document.createElement('div');
+            wrapper.className = 'row adv-row';
+
+            const label = document.createElement('label');
+            label.textContent = row.label;
+            label.htmlFor = `adv-${row.key}`;
+
+            const slider = document.createElement('input');
+            slider.type = 'range';
+            slider.id = `adv-${row.key}`;
+            slider.min = '0';
+            slider.max = '100';
+            slider.step = '1';
+
+            const readout = document.createElement('span');
+            readout.className = 'adv-value';
+            readout.id = `adv-${row.key}-value`;
+            slider.setAttribute('aria-describedby', readout.id);
+
+            wrapper.append(label, slider, readout);
+            advancedBody.appendChild(wrapper);
+
+            advancedControls[row.key] = { slider, readout, range };
+
+            slider.addEventListener('input', () => {
+                const value = sliderToValue(slider.value, range);
+                renderAdvancedRow(row.key, value);
+                commit({ [row.key]: value });
+            });
+        });
     });
 }
 
-function setAdvancedVisibility(visible) {
-    advancedSection.classList.toggle('disabled', !visible);
+function renderAdvancedRow(key, value) {
+    const control = advancedControls[key];
+    if (!control || !control.slider) return;
+    control.readout.textContent = formatValue(value, control.range);
+    control.slider.setAttribute('aria-valuetext', control.readout.textContent);
 }
 
-async function saveDynamics(values) {
-    await browser.storage.local.set(values);
-    await sendToActiveTab(Object.assign({
-        type: 'THUNDERFOX_DYNAMICS',
-        advancedEnabled: advancedToggle.checked
-    }, values));
+function renderAdvanced() {
+    Object.keys(advancedControls).forEach((key) => {
+        const control = advancedControls[key];
+        if (control.multi) {
+            control.multi.render();
+            return;
+        }
+        if (control.input) {
+            control.input.checked = !!settings[key];
+            return;
+        }
+        if (control.select) {
+            control.select.value = settings[key];
+            return;
+        }
+        control.slider.value = String(valueToSlider(settings[key], control.range));
+        renderAdvancedRow(key, settings[key]);
+    });
 }
 
-Object.keys(DYNAMICS).forEach((key) => {
-    const slider = document.getElementById(DYNAMICS_CONTROLS[key]);
-    slider.addEventListener('input', async () => {
-        const values = readDynamicsFromUI();
-        renderDynamics(values);
-        await saveDynamics(values);
+const meterLevels = { meterInput: METER_FLOOR_DB, meterOutput: METER_FLOOR_DB };
+
+function renderLevelMeter(id, peakDb) {
+    const bar = document.getElementById(id);
+    const readout = document.getElementById(`${id}-value`);
+    if (!bar) return;
+
+    const incoming = typeof peakDb === 'number' && isFinite(peakDb) ? peakDb : METER_FLOOR_DB;
+    // Rise instantly, fall gradually.
+    const held = Math.max(incoming, meterLevels[id] - METER_DECAY_DB);
+    const level = Math.max(METER_FLOOR_DB, Math.min(0, held));
+    meterLevels[id] = level;
+
+    bar.style.width = `${((level - METER_FLOOR_DB) / -METER_FLOOR_DB) * 100}%`;
+    if (readout) {
+        readout.textContent = level <= METER_FLOOR_DB ? '-∞' : level.toFixed(1);
+    }
+}
+
+// The auto level's gain (dimmed while its gate holds it) and the deepest
+// limiter reduction since the last reading.
+function renderReadings(message) {
+    const gain = typeof message.agcGainDb === 'number' ? message.agcGainDb : 0;
+    agcReading.textContent = `${gain > 0 ? '+' : ''}${gain.toFixed(1)} dB`;
+    agcReading.style.opacity = message.agcGate === 2 ? '0.5' : '';
+    agcReading.title = message.agcGate === 2 ? 'Holding: pause or quiet passage' : '';
+    const reduction = typeof message.limiterReductionDb === 'number' ? message.limiterReductionDb : 0;
+    grReading.textContent = `${reduction > 0.05 ? '-' : ''}${reduction.toFixed(1)} dB`;
+}
+
+/* ------------------------------------------------------------------ meters */
+
+function connectMeters() {
+    if (!currentTab) return;
+    try {
+        meterPort = browser.tabs.connect(currentTab.id, { name: 'thunderfox-meters' });
+    } catch (_) {
+        return;
+    }
+
+    meterPort.onMessage.addListener((message) => {
+        if (!message || message.type !== 'meters') return;
+        renderLevelMeter('meterInput', message.inputDb);
+        renderLevelMeter('meterOutput', message.outputDb);
+        renderReadings(message);
     });
-});
 
-advancedToggle.addEventListener('change', async () => {
-    const enabled = advancedToggle.checked;
-    setAdvancedVisibility(enabled);
-    await browser.storage.local.set({ advancedEnabled: enabled });
-    await sendToActiveTab(Object.assign({
-        type: 'THUNDERFOX_DYNAMICS',
-        advancedEnabled: enabled
-    }, readDynamicsFromUI()));
-});
+    meterPort.onDisconnect.addListener(() => { meterPort = null; });
+}
 
-advancedResetBtn.addEventListener('click', async () => {
-    const defaults = {};
-    Object.keys(DYNAMICS).forEach((key) => {
-        defaults[key] = DYNAMICS[key].default;
-    });
-    renderDynamics(defaults);
-    await saveDynamics(defaults);
-});
-
-/* Site exemption */
+/* ------------------------------------------------------------- exemptions */
 
 function setExemptUnavailable(reason) {
     exemptToggle.disabled = true;
@@ -225,7 +618,7 @@ async function applyExemptChange() {
         exemptedSites = exemptedSites.filter((site) => !rules.includes(site));
     }
 
-    await browser.storage.local.set({ exemptedSites });
+    await browser.storage.local.set({ exemptedSites, audioBlockedHost: '' });
 
     // Once createMediaElementSource() has run on an element there is no way to
     // hand it back to the browser, so a reload is the only honest bypass.
@@ -240,14 +633,6 @@ async function applyExemptChange() {
         exemptHint.textContent = 'Saved. Reload the tab to apply.';
     }
 }
-
-exemptToggle.addEventListener('change', () => {
-    applyExemptChange().catch((error) => {
-        console.error('ThunderFox: failed to update exemption', error);
-        exemptHint.textContent = 'Could not update the exemption list.';
-        exemptHint.hidden = false;
-    });
-});
 
 async function initExemptState() {
     const tabs = await browser.tabs.query({ active: true, currentWindow: true });
@@ -271,155 +656,81 @@ async function initExemptState() {
     renderExemptState();
 }
 
-async function init() {
-    // Resolve the tab first so every later message has somewhere to go. A
-    // failure here must not take the rest of the popup down with it.
-    try {
-        await initExemptState();
-    } catch (error) {
-        console.error('ThunderFox: failed to resolve the active tab', error);
-        setExemptUnavailable('Could not read the current tab.');
-    }
+/* ------------------------------------------------------------------- wiring */
 
-    const stored = await browser.storage.local.get({
-        enabled: true,
-        hpEnabled: false,
-        limiterThreshold: -12,
-        eqGains: [0, 0, 0, 0, 0, 0, 0, 0],
-        eqEnabled: true,
-        advancedEnabled: false,
-        preBoostDb: DYNAMICS.preBoostDb.default,
-        compAttackMs: DYNAMICS.compAttackMs.default,
-        compReleaseMs: DYNAMICS.compReleaseMs.default,
-        limiterAttackMs: DYNAMICS.limiterAttackMs.default,
-        limiterReleaseMs: DYNAMICS.limiterReleaseMs.default
-    });
-
-    toggle.checked = !!stored.enabled;
-    setStatus(!!stored.enabled);
-    hpToggle.checked = !!stored.hpEnabled;
-
-    const initialEqEnabled = stored.eqEnabled !== undefined ? !!stored.eqEnabled : true;
-    if (eqToggle) eqToggle.checked = initialEqEnabled;
-    setEQVisibility(initialEqEnabled);
-    limiterThreshold.value = String(-stored.limiterThreshold);
-    renderLoudness();
-
-    advancedToggle.checked = !!stored.advancedEnabled;
-    setAdvancedVisibility(!!stored.advancedEnabled);
-    renderDynamics({
-        preBoostDb: stored.preBoostDb,
-        compAttackMs: stored.compAttackMs,
-        compReleaseMs: stored.compReleaseMs,
-        limiterAttackMs: stored.limiterAttackMs,
-        limiterReleaseMs: stored.limiterReleaseMs
-    });
-
-    // Initialize EQ sliders
-    const gains = Array.isArray(stored.eqGains) && stored.eqGains.length === 8
-        ? stored.eqGains
-        : [0, 0, 0, 0, 0, 0, 0, 0];
-    gains.forEach((gain, index) => {
-        if (eqSliders[index]) {
-            eqSliders[index].min = "-18";
-            eqSliders[index].max = "18";
-            eqSliders[index].value = String(gain);
-            updateEQValue(index, gain);
-        }
-    });
-    requestAnimationFrame(drawEQCurve);
-}
-
-toggle.addEventListener('change', async () => {
-    const enabled = toggle.checked;
-    await browser.storage.local.set({ enabled });
-    setStatus(enabled);
-    await sendToActiveTab({ type: 'THUNDERFOX_TOGGLE', enabled });
+toggle.addEventListener('change', () => {
+    setStatus(toggle.checked);
+    commit({ enabled: toggle.checked });
 });
 
-hpToggle.addEventListener('change', async () => {
-    const enabled = hpToggle.checked;
-    await browser.storage.local.set({ hpEnabled: enabled });
-    await sendToActiveTab({ type: 'THUNDERFOX_HP_TOGGLE', enabled });
+hpToggle.addEventListener('change', () => {
+    commit({ hpEnabled: hpToggle.checked });
 });
 
-if (eqToggle) {
-    eqToggle.addEventListener('change', async () => {
-        const enabled = eqToggle.checked;
-        setEQVisibility(enabled);
-        await browser.storage.local.set({ eqEnabled: enabled });
-        await sendToActiveTab({ type: 'THUNDERFOX_EQ_TOGGLE', enabled });
-    });
-}
-
-// One macro morphs compression strength and limiter drive together, so the
-// readout is a percentage rather than either underlying value.
-function renderLoudness() {
-    if (!loudnessValue) return;
-    const percent = Math.round((Number(limiterThreshold.value) / MAX_LOUDNESS_DB) * 100);
-    loudnessValue.textContent = `${percent}%`;
-}
-
-limiterThreshold.addEventListener('input', async () => {
-    const th = -Number(limiterThreshold.value);
-    renderLoudness();
-    await browser.storage.local.set({ limiterThreshold: th });
-    await sendToActiveTab({ type: 'THUNDERFOX_LIMITER_THRESHOLD', threshold: th });
+eqToggle.addEventListener('change', () => {
+    setEQVisibility(eqToggle.checked);
+    commit({ eqEnabled: eqToggle.checked });
 });
 
-function updateEQValue(bandIndex, value) {
-    if (eqValues[bandIndex]) {
-        eqValues[bandIndex].textContent = value >= 0 ? `+${value.toFixed(1)}` : value.toFixed(1);
-    }
-}
-
-async function updateEQBand(bandIndex) {
-    const gainDb = Number(eqSliders[bandIndex].value);
-    updateEQValue(bandIndex, gainDb);
-
-    // Get current gains and update
-    const { eqGains } = await browser.storage.local.get({ eqGains: [0, 0, 0, 0, 0, 0, 0, 0] });
-    const gains = Array.isArray(eqGains) && eqGains.length === 8 ? eqGains : [0, 0, 0, 0, 0, 0, 0, 0];
-    gains[bandIndex] = gainDb;
-
-    await browser.storage.local.set({ eqGains: gains });
-    await sendToActiveTab({ type: 'THUNDERFOX_EQ_GAIN', bandIndex, gainDb });
-    requestAnimationFrame(drawEQCurve);
-}
-
-// Add event listeners for all EQ sliders
-eqSliders.forEach((slider, index) => {
-    if (slider) {
-        slider.addEventListener('input', () => updateEQBand(index));
-    }
+loudnessSlider.addEventListener('input', () => {
+    const amount = Number(loudnessSlider.value) / 100;
+    renderLoudnessValue(amount);
+    commit({ loudness: amount });
 });
 
-// Reset EQ button handler
-async function resetEQ() {
-    const resetGains = [0, 0, 0, 0, 0, 0, 0, 0];
+densitySlider.addEventListener('input', () => {
+    const amount = Number(densitySlider.value) / 100;
+    renderDensityValue(amount);
+    commit({ density: amount });
+});
 
-    resetGains.forEach((gain, index) => {
-        if (eqSliders[index]) {
-            eqSliders[index].value = String(gain);
-            updateEQValue(index, gain);
-        }
+advancedToggle.addEventListener('change', () => {
+    setAdvancedVisibility(advancedToggle.checked);
+    commit({ advancedEnabled: advancedToggle.checked });
+});
+
+advancedResetBtn.addEventListener('click', () => {
+    const patch = {};
+    S.ADVANCED_ALL_KEYS.forEach((key) => { patch[key] = S.DEFAULTS[key]; });
+    Object.assign(settings, patch);
+    renderAdvanced();
+    commit(patch);
+});
+
+eqResetBtn.addEventListener('click', () => {
+    const gains = S.DEFAULTS.eqGains.slice();
+    settings.eqGains = gains;
+    renderEq();
+    commit({ eqGains: gains });
+});
+
+exemptToggle.addEventListener('change', () => {
+    applyExemptChange().catch((error) => {
+        console.error('ThunderFox: failed to update exemption', error);
+        exemptHint.textContent = 'Could not update the exemption list.';
+        exemptHint.hidden = false;
     });
-    requestAnimationFrame(drawEQCurve);
+});
 
-    await browser.storage.local.set({ eqGains: resetGains });
-    await sendToActiveTab({ type: 'THUNDERFOX_EQ_GAINS', gainsDb: resetGains });
+manageExemptionsBtn.addEventListener('click', async () => {
+    flushWrites();
+    await browser.runtime.openOptionsPage();
+    window.close();
+});
+
+function setEQVisibility(visible) {
+    eqSection.classList.toggle('disabled', !visible);
+    if (visible) requestAnimationFrame(drawEQCurve);
 }
 
-if (eqResetBtn) {
-    eqResetBtn.addEventListener('click', resetEQ);
+function setAdvancedVisibility(visible) {
+    advancedSection.classList.toggle('disabled', !visible);
 }
 
-if (manageExemptionsBtn) {
-    manageExemptionsBtn.addEventListener('click', async () => {
-        await browser.runtime.openOptionsPage();
-        window.close();
-    });
-}
+/* --------------------------------------------------------------- EQ curve */
+
+const canvas = document.createElement('canvas');
+canvas.className = 'eq-curve-canvas';
 
 function drawEQCurve() {
     if (!canvas || !eqBands || eqSection.classList.contains('disabled')) return;
@@ -451,14 +762,9 @@ function drawEQCurve() {
         ? parseFloat(getComputedStyle(eqSliders[0]).getPropertyValue('--eq-thumb')) || 0
         : 0;
 
-    const points = eqSliders.map(slider => {
-        if (!slider) return null;
+    const points = eqSliders.map((slider) => {
         const sRect = slider.getBoundingClientRect();
-        // Calculate center X relative to the bands container
         const x = sRect.left + sRect.width / 2 - rect.left;
-
-        // Calculate Y based on slider value
-        // The slider is rotated -90deg, so "max" is visually at the top
         const centerY = sRect.top + sRect.height / 2 - rect.top;
         const val = parseFloat(slider.value);
         const min = parseFloat(slider.min);
@@ -467,38 +773,99 @@ function drawEQCurve() {
         // Visual travel distance of the thumb, measured rather than hardcoded
         // so the curve follows whatever dimensions the CSS specifies.
         const trackLength = Math.max(sRect.height - thumbSize, 1);
-
-        // Normalize value (-1 to 1)
         const norm = (val - (min + max) / 2) / ((max - min) / 2);
-        // Invert Y because screen Y grows downwards, but we want max value at top
-        const y = centerY - (norm * (trackLength / 2));
-
-        return { x, y };
-    }).filter(p => p !== null);
+        // Invert Y because screen Y grows downwards, but we want max at top.
+        return { x, y: centerY - (norm * (trackLength / 2)) };
+    });
 
     if (points.length < 2) return;
 
     ctx.beginPath();
     ctx.moveTo(points[0].x, points[0].y);
-
-    // Draw smooth curve through points
     for (let i = 0; i < points.length - 1; i++) {
         const p0 = points[Math.max(0, i - 1)];
         const p1 = points[i];
         const p2 = points[i + 1];
         const p3 = points[Math.min(points.length - 1, i + 2)];
-
-        const cp1x = p1.x + (p2.x - p0.x) / 6;
-        const cp1y = p1.y + (p2.y - p0.y) / 6;
-        const cp2x = p2.x - (p3.x - p1.x) / 6;
-        const cp2y = p2.y - (p3.y - p1.y) / 6;
-
-        ctx.bezierCurveTo(cp1x, cp1y, cp2x, cp2y, p2.x, p2.y);
+        ctx.bezierCurveTo(
+            p1.x + (p2.x - p0.x) / 6, p1.y + (p2.y - p0.y) / 6,
+            p2.x - (p3.x - p1.x) / 6, p2.y - (p3.y - p1.y) / 6,
+            p2.x, p2.y
+        );
     }
     ctx.stroke();
 }
 
 window.addEventListener('resize', drawEQCurve);
+
+/* ------------------------------------------------------------------- init */
+
+function renderBlockedNotice(blockedHost) {
+    const blocked = !!blockedHost && blockedHost === currentHostname;
+    blockedNotice.hidden = !blocked;
+    if (blocked) {
+        blockedNotice.textContent =
+            'This site\'s audio reads as silent while ThunderFox is processing it, '
+            + 'usually because the media is served cross-origin without CORS headers. '
+            + 'Exempt the site below and reload to restore it.';
+    }
+}
+
+async function init() {
+    buildEq();
+    buildAdvanced();
+
+    // Paint the defaults before the first await, so the readouts never show a
+    // value that lives only in the markup. Stored values replace them below.
+    renderMacros();
+    renderEq();
+    renderAdvanced();
+
+    // Resolve the tab first so every later message has somewhere to go. A
+    // failure here must not take the rest of the popup down with it.
+    try {
+        await initExemptState();
+    } catch (error) {
+        console.error('ThunderFox: failed to resolve the active tab', error);
+        setExemptUnavailable('Could not read the current tab.');
+    }
+
+    const stored = await browser.storage.local.get(
+        Object.assign({ audioBlockedHost: '' }, S.DEFAULTS)
+    );
+
+    settings = Object.assign({}, S.DEFAULTS, S.sanitizeAdvanced(stored), {
+        enabled: !!stored.enabled,
+        hpEnabled: !!stored.hpEnabled,
+        eqEnabled: stored.eqEnabled === undefined ? true : !!stored.eqEnabled,
+        advancedEnabled: !!stored.advancedEnabled,
+        loudness: S.sanitizeUnit(stored.loudness, S.DEFAULTS.loudness),
+        density: S.sanitizeUnit(stored.density, S.DEFAULTS.density),
+        eqGains: S.sanitizeEqGains(stored.eqGains)
+    });
+
+    toggle.checked = settings.enabled;
+    setStatus(settings.enabled);
+    hpToggle.checked = settings.hpEnabled;
+    eqToggle.checked = settings.eqEnabled;
+    setEQVisibility(settings.eqEnabled);
+    advancedToggle.checked = settings.advancedEnabled;
+    setAdvancedVisibility(settings.advancedEnabled);
+
+    renderMacros();
+    renderEq();
+    renderAdvanced();
+    renderBlockedNotice(stored.audioBlockedHost);
+
+    // The watchdog needs two seconds of playback to decide, which is often
+    // longer than it takes the user to open the popup.
+    browser.storage.onChanged.addListener((changes, area) => {
+        if (area !== 'local' || !changes.audioBlockedHost) return;
+        renderBlockedNotice(changes.audioBlockedHost.newValue);
+    });
+
+    connectMeters();
+}
 
 init().catch((error) => {
     console.error('ThunderFox: popup failed to initialize', error);
